@@ -1,0 +1,114 @@
+"""Checkpoint loading and validation."""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+import torch
+from safetensors.torch import load_file
+
+logger = logging.getLogger(__name__)
+
+SMOLVLA_EXPECTED_PREFIXES = [
+    "model.vision_encoder",
+    "model.language_model",
+    "model.action_expert",
+]
+
+SUPPORTED_MODELS = {
+    "smolvla": {
+        "hf_id": "lerobot/smolvla_base",
+        "params_m": 450,
+        "vision_encoder": "siglip",
+        "backbone": "smollm2",
+        "action_head": "flow_matching",
+        "num_denoising_steps": 10,
+        "action_chunk_size": 50,
+        "action_dim": 6,
+    },
+}
+
+
+def detect_model_type(state_dict: dict[str, torch.Tensor]) -> str | None:
+    keys = set(state_dict.keys())
+    for prefix in SMOLVLA_EXPECTED_PREFIXES:
+        if any(k.startswith(prefix) for k in keys):
+            return "smolvla"
+    return None
+
+
+def load_checkpoint(
+    path_or_id: str,
+    device: str = "cpu",
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    """Load a VLA checkpoint from local path or HuggingFace Hub.
+
+    Returns (state_dict, config_dict).
+    """
+    path = Path(path_or_id)
+
+    if path.exists() and path.suffix == ".safetensors":
+        logger.info("Loading local safetensors: %s", path)
+        state_dict = load_file(str(path), device=device)
+        config_path = path.parent / "config.json"
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        return state_dict, config
+
+    if path.is_dir():
+        safetensors_files = list(path.glob("*.safetensors"))
+        if not safetensors_files:
+            raise FileNotFoundError(f"No safetensors files in {path}")
+        state_dict = {}
+        for f in sorted(safetensors_files):
+            state_dict.update(load_file(str(f), device=device))
+        config_path = path / "config.json"
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        return state_dict, config
+
+    # Assume HuggingFace Hub ID
+    logger.info("Downloading from HuggingFace Hub: %s", path_or_id)
+    try:
+        from huggingface_hub import snapshot_download
+
+        local_dir = snapshot_download(path_or_id)
+        return load_checkpoint(local_dir, device=device)
+    except ImportError:
+        raise ImportError("Install huggingface_hub: pip install huggingface_hub")
+
+
+def validate_checkpoint(
+    state_dict: dict[str, torch.Tensor],
+    model_type: str,
+) -> list[str]:
+    """Validate checkpoint keys against expected structure. Returns list of warnings."""
+    warnings = []
+    model_info = SUPPORTED_MODELS.get(model_type)
+    if model_info is None:
+        warnings.append(f"Unknown model type: {model_type}")
+        return warnings
+
+    total_params = sum(p.numel() for p in state_dict.values())
+    expected_params = model_info["params_m"] * 1_000_000
+    ratio = total_params / expected_params
+    if ratio < 0.8 or ratio > 1.2:
+        warnings.append(
+            f"Parameter count {total_params / 1e6:.1f}M differs from expected "
+            f"{model_info['params_m']}M by {abs(1 - ratio) * 100:.0f}%"
+        )
+
+    key_prefixes = set()
+    for key in state_dict.keys():
+        parts = key.split(".")
+        if len(parts) >= 2:
+            key_prefixes.add(f"{parts[0]}.{parts[1]}")
+
+    logger.info(
+        "Loaded %d tensors, %.1fM params, %d key prefixes",
+        len(state_dict),
+        total_params / 1e6,
+        len(key_prefixes),
+    )
+    return warnings

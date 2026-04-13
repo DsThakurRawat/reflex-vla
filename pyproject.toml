@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reflex-vla"
+version = "0.1.0"
+description = "Deploy any VLA model to any edge hardware. One command."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Reflex Labs" }]
+keywords = ["vla", "robotics", "edge", "tensorrt", "jetson", "deployment"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "torch>=2.1.0",
+    "safetensors>=0.4.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+onnx = ["onnx>=1.15.0", "onnxruntime>=1.17.0"]
+# tensorrt = ["tensorrt>=10.0"]  # install on Linux/Jetson only: pip install tensorrt
+safety = ["yourdfpy"]
+dev = ["pytest>=8.0", "ruff>=0.4.0", "mypy>=1.10"]
+
+[project.scripts]
+reflex = "reflex.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reflex"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

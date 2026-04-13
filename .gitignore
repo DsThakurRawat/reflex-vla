@@ -1,0 +1,1 @@
+.venv/\n__pycache__/\n*.egg-info/\n*.pyc\ndist/\nbuild/\n.pytest_cache/

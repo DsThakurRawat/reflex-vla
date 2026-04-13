@@ -1,0 +1,142 @@
+"""Op decomposition for ONNX/TensorRT compatibility.
+
+RMSNorm and RoPE are not supported by TensorRT's ONNX parser.
+This module replaces them with equivalent elementwise operations.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+
+
+class DecomposedRMSNorm(nn.Module):
+    """RMSNorm decomposed into elementwise ops for ONNX export.
+
+    Replaces: y = x * rsqrt(mean(x^2) + eps) * weight
+    """
+
+    def __init__(self, weight: torch.Tensor, eps: float = 1e-6):
+        super().__init__()
+        self.register_buffer("weight", weight.clone())
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        x_normed = x * torch.rsqrt(variance + self.eps)
+        return (x_normed * self.weight).to(x.dtype)
+
+
+class DecomposedRotaryEmbedding(nn.Module):
+    """Rotary Position Embedding decomposed for ONNX export.
+
+    Precomputes sin/cos tables and applies via elementwise mul + gather.
+    """
+
+    def __init__(self, dim: int, max_seq_len: int = 4096, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, inv_freq)
+        cos_cached = torch.cat([freqs.cos(), freqs.cos()], dim=-1)
+        sin_cached = torch.cat([freqs.sin(), freqs.sin()], dim=-1)
+        self.register_buffer("cos_cached", cos_cached)
+        self.register_buffer("sin_cached", sin_cached)
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos = self.cos_cached[position_ids].unsqueeze(1)
+        sin = self.sin_cached[position_ids].unsqueeze(1)
+        q_embed = self._apply_rotary(q, cos, sin)
+        k_embed = self._apply_rotary(k, cos, sin)
+        return q_embed, k_embed
+
+    @staticmethod
+    def _apply_rotary(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        rotated = torch.cat((-x2, x1), dim=-1)
+        return x * cos + rotated * sin
+
+
+def find_rmsnorm_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Find all RMSNorm modules in a model."""
+    results = []
+    for name, module in model.named_modules():
+        module_type = type(module).__name__
+        if "RMSNorm" in module_type or "rmsnorm" in module_type.lower():
+            results.append((name, module))
+    return results
+
+
+def find_rope_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Find all RotaryEmbedding modules in a model."""
+    results = []
+    for name, module in model.named_modules():
+        module_type = type(module).__name__
+        if "Rotary" in module_type or "rotary" in module_type.lower():
+            results.append((name, module))
+    return results
+
+
+def replace_module(parent: nn.Module, name: str, new_module: nn.Module) -> None:
+    """Replace a named submodule in a parent module."""
+    parts = name.split(".")
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], new_module)
+
+
+def decompose_rmsnorm(model: nn.Module) -> int:
+    """Replace all RMSNorm modules with ONNX-compatible decompositions.
+
+    Returns the number of modules replaced.
+    """
+    count = 0
+    for name, module in find_rmsnorm_modules(model):
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            continue
+        eps = getattr(module, "eps", 1e-6) or getattr(module, "variance_epsilon", 1e-6)
+        decomposed = DecomposedRMSNorm(weight, eps=eps)
+        replace_module(model, name, decomposed)
+        count += 1
+    return count
+
+
+def decompose_rope(model: nn.Module, max_seq_len: int = 4096) -> int:
+    """Replace all RotaryEmbedding modules with ONNX-compatible decompositions.
+
+    Returns the number of modules replaced.
+    """
+    count = 0
+    for name, module in find_rope_modules(model):
+        dim = getattr(module, "dim", None)
+        if dim is None:
+            # Try to infer from inv_freq
+            inv_freq = getattr(module, "inv_freq", None)
+            if inv_freq is not None:
+                dim = inv_freq.shape[0] * 2
+            else:
+                continue
+        base = getattr(module, "base", 10000.0)
+        decomposed = DecomposedRotaryEmbedding(dim, max_seq_len=max_seq_len, base=base)
+        replace_module(model, name, decomposed)
+        count += 1
+    return count
+
+
+def prepare_for_export(model: nn.Module, max_seq_len: int = 4096) -> dict[str, int]:
+    """Decompose all ONNX-incompatible ops in a VLA model.
+
+    Returns counts of replaced modules.
+    """
+    model.eval()
+    rmsnorm_count = decompose_rmsnorm(model)
+    rope_count = decompose_rope(model, max_seq_len=max_seq_len)
+    return {"rmsnorm_replaced": rmsnorm_count, "rope_replaced": rope_count}
