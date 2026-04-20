@@ -22,6 +22,7 @@ torch = pytest.importorskip("torch")
 from reflex.distill.teacher_loader import (
     V03_TEACHER_ALLOWLIST,
     LoadedTeacher,
+    _resolve_teacher_path,
     load_teacher,
     resolve_policy_type,
 )
@@ -112,6 +113,37 @@ class TestLoadTeacher:
 
     def test_v03_allowlist_is_pi_family_only(self):
         assert V03_TEACHER_ALLOWLIST == frozenset({"pi0", "pi05"})
+
+
+class TestResolveTeacherPath:
+    def test_local_path_passes_through(self, tmp_path):
+        (tmp_path / "config.json").write_text("{}")
+        assert _resolve_teacher_path(tmp_path) == tmp_path
+
+    def test_hf_id_triggers_snapshot_download(self, tmp_path):
+        """'lerobot/pi0_base' should resolve via huggingface_hub."""
+        cached_dir = tmp_path / "cache" / "lerobot_pi0_base"
+        cached_dir.mkdir(parents=True)
+        with patch(
+            "huggingface_hub.snapshot_download",
+            return_value=str(cached_dir),
+        ) as mock_dl:
+            result = _resolve_teacher_path("lerobot/pi0_base")
+        assert result == cached_dir
+        mock_dl.assert_called_once_with(
+            repo_id="lerobot/pi0_base", repo_type="model",
+        )
+
+    def test_nonexistent_local_path_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="HF repo id"):
+            _resolve_teacher_path(tmp_path / "does_not_exist")
+
+    def test_path_like_strings_dont_trigger_hf(self):
+        """'./my_teacher' or '/abs/path' shouldn't hit the HF hub."""
+        with pytest.raises(FileNotFoundError, match="HF repo id"):
+            _resolve_teacher_path("./not_real")
+        with pytest.raises(FileNotFoundError, match="HF repo id"):
+            _resolve_teacher_path("/abs/nonexistent/path")
 
 
 # ---------------------------------------------------------------------------

@@ -91,12 +91,15 @@ def load_teacher(
     dtype: str = "bf16",
     allowlist: frozenset[str] = V03_TEACHER_ALLOWLIST,
 ) -> LoadedTeacher:
-    """Load a frozen teacher policy from a reflex-export dir.
+    """Load a frozen teacher policy from a reflex-export dir OR HF id.
 
     Args:
-      teacher_export: local path to a reflex-export dir (the `merged/`
-        subdir if source was a LoRA fine-tune, or the monolithic
-        `pretrained_model/` dir directly).
+      teacher_export: either
+        - a local path to a reflex-export dir (the `merged/`
+          subdir if source was a LoRA fine-tune, or the monolithic
+          `pretrained_model/` dir directly), or
+        - an HF repo id like 'lerobot/pi0_base' — the loader will
+          snapshot_download it to the HF cache before proceeding.
       device: where to place the teacher. 'cpu' is safe for small
         teachers + dev; 'cuda' for training.
       dtype: 'bf16' | 'fp32'. bf16 saves memory during distillation.
@@ -104,16 +107,11 @@ def load_teacher(
         pi0 + pi0.5 only (SmolVLA v0.3.1; GR00T v0.5+).
 
     Returns a LoadedTeacher. Raises ValueError on unsupported
-    policy_type, FileNotFoundError if the dir is missing.
+    policy_type, FileNotFoundError if neither path nor HF resolves.
     """
     import torch
 
-    path = Path(teacher_export)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"teacher export not found: {teacher_export}. Expected a "
-            f"reflex-export dir (model.safetensors + config.json)."
-        )
+    path = _resolve_teacher_path(teacher_export)
     config_path = path / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(
@@ -150,6 +148,55 @@ def load_teacher(
         config=config,
         policy_type=policy_type,
         checkpoint_dir=path,
+    )
+
+
+def _resolve_teacher_path(teacher_export: str | Path) -> Path:
+    """Return a local Path to the teacher's reflex-export dir.
+
+    Dispatch:
+      1. If the argument is an existing local path → use it.
+      2. Else if it looks like an HF repo id ('org/name' pattern, not
+         absolute, not starting with './') → snapshot_download to the HF
+         cache and return the cached path.
+      3. Else → FileNotFoundError with an actionable hint.
+
+    HF downloads are cached by huggingface_hub automatically, so a
+    second call with the same id is a no-op. We pull the full
+    repo (config.json + model.safetensors + processor files) so the
+    downstream `from_pretrained` call can read everything locally.
+    """
+    path = Path(teacher_export)
+    if path.exists():
+        return path
+
+    # Heuristic: 'org/repo' is a repo id. Reject obvious path-like strings
+    # before attempting an HF download to avoid spurious network calls on
+    # typos (e.g. './my_teacher/' with a trailing slash that doesn't exist).
+    s = str(teacher_export)
+    looks_like_hf_id = (
+        "/" in s
+        and not s.startswith(("./", "/", "~", ".."))
+        and not s.endswith("/")
+        and s.count("/") >= 1
+    )
+    if looks_like_hf_id:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as e:
+            raise FileNotFoundError(
+                f"teacher export not found locally: {teacher_export}. "
+                f"Looks like an HF repo id, but huggingface_hub is not "
+                f"installed: {e}. Install it or pass a local path."
+            )
+        logger.info("[teacher_loader] downloading %s from HF Hub", s)
+        cached = snapshot_download(repo_id=s, repo_type="model")
+        return Path(cached)
+
+    raise FileNotFoundError(
+        f"teacher export not found: {teacher_export}. Expected a "
+        f"reflex-export dir (model.safetensors + config.json) OR an "
+        f"HF repo id like 'lerobot/pi0_base'."
     )
 
 
