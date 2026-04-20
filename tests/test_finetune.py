@@ -95,15 +95,18 @@ class TestLerobotCommandBuild:
         cmd = _build_lerobot_command(cfg)
         assert cmd[0] == "lerobot-train"
         # Sanity: all the important knobs flow through as draccus args.
+        # Schema is pinned to lerobot 0.5.1. If lerobot renames flags
+        # upstream, this test catches it.
         joined = " ".join(cmd)
-        assert "--policy.path=lerobot/smolvla_base" in joined
+        assert "--policy.pretrained_model_path=lerobot/smolvla_base" in joined
         assert "--dataset.repo_id=lerobot/libero" in joined
         assert "--steps=5000" in joined
         assert "--batch_size=16" in joined
-        assert "--policy.optimizer_lr=0.0002" in joined
-        assert "--policy.use_lora=true" in joined
-        assert "--policy.lora_rank=32" in joined
-        assert "--precision=bf16" in joined
+        assert "--optimizer.lr=0.0002" in joined
+        assert "--peft.method_type=lora" in joined
+        assert "--peft.r=32" in joined
+        # precision is NOT a top-level lerobot 0.5.1 flag — should not appear
+        assert "--precision=" not in joined
 
     def test_extra_args_pass_through(self, tmp_path):
         cfg = FinetuneConfig(

@@ -68,24 +68,36 @@ def _build_lerobot_command(cfg: FinetuneConfig) -> list[str]:
     translate our flat FinetuneConfig into the equivalent. Extra knobs
     not yet first-class in FinetuneConfig come through extra_lerobot_args.
 
-    Schema here is best-effort for lerobot 0.5.1; the generated command
-    is surfaced in the training log so customers can reproduce manually
-    if lerobot's CLI shifts upstream.
+    Schema targets lerobot 0.5.1 specifically (the version pinned in the
+    Modal image). If lerobot's CLI shifts upstream, update here — the
+    generated command is always surfaced in the training log so
+    customers can reproduce manually.
+
+    Key arg names per lerobot 0.5.1:
+      --policy.pretrained_model_path   (NOT --policy.path)
+      --optimizer.lr                   (NOT --policy.optimizer_lr)
+      --peft.method_type=lora          (enables PEFT)
+      --peft.r                         (LoRA rank)
+
+    cfg.precision is intentionally NOT passed through — lerobot 0.5.1
+    doesn't expose a top-level precision flag; it's baked into the
+    policy config. v0.5 will add per-policy precision overrides.
     """
     cmd = [
         "lerobot-train",
-        f"--policy.path={cfg.base}",
+        f"--policy.pretrained_model_path={cfg.base}",
         f"--dataset.repo_id={cfg.dataset}",
         f"--output_dir={cfg.output}",
         f"--steps={cfg.num_steps}",
         f"--batch_size={cfg.batch_size}",
-        f"--policy.optimizer_lr={cfg.learning_rate}",
+        f"--optimizer.lr={cfg.learning_rate}",
         f"--seed={cfg.seed}",
-        # LoRA-specific knobs — lerobot 0.4.4+ supports these via PEFT.
-        f"--policy.use_lora=true",
-        f"--policy.lora_rank={cfg.lora_rank}",
-        f"--precision={cfg.precision}",
     ]
+    if cfg.mode == "lora":
+        cmd.extend([
+            f"--peft.method_type=lora",
+            f"--peft.r={cfg.lora_rank}",
+        ])
     for k, v in cfg.extra_lerobot_args.items():
         cmd.append(f"--{k}={v}")
     return cmd
