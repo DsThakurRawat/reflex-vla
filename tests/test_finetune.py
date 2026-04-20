@@ -98,6 +98,7 @@ class TestLerobotCommandBuild:
         # Schema is pinned to lerobot 0.5.1. If lerobot renames flags
         # upstream, this test catches it.
         joined = " ".join(cmd)
+        assert "--policy.type=smolvla" in joined
         assert "--policy.pretrained_model_path=lerobot/smolvla_base" in joined
         assert "--dataset.repo_id=lerobot/libero" in joined
         assert "--steps=5000" in joined
@@ -107,6 +108,18 @@ class TestLerobotCommandBuild:
         assert "--peft.r=32" in joined
         # precision is NOT a top-level lerobot 0.5.1 flag — should not appear
         assert "--precision=" not in joined
+
+    def test_policy_type_inference(self):
+        from reflex.finetune.run import _infer_policy_type
+        assert _infer_policy_type("lerobot/smolvla_base") == "smolvla"
+        assert _infer_policy_type("lerobot/pi0_base") == "pi0"
+        assert _infer_policy_type("lerobot/pi05_base") == "pi05"
+        assert _infer_policy_type("nvidia/GR00T-N1.6-3B") == "gr00t_n1_5"
+
+    def test_policy_type_unknown_rejected(self):
+        from reflex.finetune.run import _infer_policy_type
+        with pytest.raises(ValueError, match="Could not infer"):
+            _infer_policy_type("some-random/unknown-model")
 
     def test_extra_args_pass_through(self, tmp_path):
         cfg = FinetuneConfig(

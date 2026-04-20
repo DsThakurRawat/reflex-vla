@@ -61,6 +61,34 @@ def _validate_config(cfg: FinetuneConfig) -> list[str]:
     return errs
 
 
+def _infer_policy_type(base: str) -> str:
+    """Derive lerobot's policy registry name from the base model id.
+
+    lerobot 0.5.1 registers policies by short name (smolvla, pi0, pi05,
+    act, diffusion, vqbet, ...) and requires `--policy.type=<name>` at
+    CLI time. The full HF model id (e.g. 'lerobot/smolvla_base') goes
+    to `--policy.pretrained_model_path=...` separately.
+
+    Falls back to raising a clear error for unrecognized bases rather
+    than guessing. Customers can override via extra_lerobot_args={"policy.type": "..."}.
+    """
+    base_lower = base.lower()
+    if "smolvla" in base_lower:
+        return "smolvla"
+    if "pi05" in base_lower or "pi0.5" in base_lower or "pi_05" in base_lower:
+        return "pi05"
+    if "pi0" in base_lower:
+        return "pi0"
+    if "gr00t" in base_lower or "groot" in base_lower:
+        # lerobot 0.5.1 can't load N1.6 per prior Step-3 finding; v0.6 work.
+        return "gr00t_n1_5"
+    raise ValueError(
+        f"Could not infer --policy.type from base={base!r}. "
+        f"Supported in v0.3: lerobot/smolvla_base. For other bases, "
+        f"pass policy.type explicitly via extra_lerobot_args."
+    )
+
+
 def _build_lerobot_command(cfg: FinetuneConfig) -> list[str]:
     """Construct the lerobot-train invocation.
 
@@ -83,8 +111,13 @@ def _build_lerobot_command(cfg: FinetuneConfig) -> list[str]:
     doesn't expose a top-level precision flag; it's baked into the
     policy config. v0.5 will add per-policy precision overrides.
     """
+    # draccus requires `policy.type` to select which PreTrainedConfig
+    # subclass to decode into. Infer from the base-model id.
+    policy_type = _infer_policy_type(cfg.base)
+
     cmd = [
         "lerobot-train",
+        f"--policy.type={policy_type}",
         f"--policy.pretrained_model_path={cfg.base}",
         f"--dataset.repo_id={cfg.dataset}",
         f"--output_dir={cfg.output}",
