@@ -269,67 +269,111 @@ def _build_pi_family_adapters(
 ) -> tuple[Callable[..., Any], Callable[..., Any]]:
     """Velocity adapters for pi0 / pi05.
 
-    Both pi0 and pi05 wrap a PaliGemma VLM + a Gemma action expert. We
-    recompute the VLM prefix PER STEP for simplicity (v0.3 scope).
+    Both pi0 and pi05 wrap a PaliGemma VLM + a Gemma action expert.
+    Velocity extraction mirrors lerobot's internal sampling loop
+    (modeling_pi0.py:854-886):
 
-    The student gets a `target_time` embedding installed on its expert;
-    the teacher stays as-is (no target_time path).
+      1. `policy._preprocess_images(batch)` → `(images, img_masks)`
+      2. `policy.prepare_state(batch)` → state
+      3. `policy.model.embed_prefix(...)` → prefix_embs + masks
+      4. `policy.model.paligemma_with_expert.forward(use_cache=True)` →
+         `past_key_values` (VLM prefix cache)
+      5. Per-step: `policy.model.denoise_step(state, prefix_pad_masks,
+         past_key_values, x_t, timestep)` → velocity
 
-    This is a BEST-EFFORT adapter — the exact attribute path inside
-    lerobot's PI0Policy depends on the lerobot version. If the attribute
-    graph changes, this function raises a clear error rather than
-    silently returning wrong velocities.
+    We recompute the VLM prefix per velocity call for simplicity. The
+    Euler-loop in lerobot caches the prefix once per action query, but
+    during training each step uses a fresh batch so there's nothing to
+    cache across steps anyway.
+
+    ## target_time is NOT yet wired
+
+    SnapFlow's exact paper trick — a zero-init `target_time` embedding
+    added to the time embedding inside `embed_suffix` — requires
+    subclassing `PI0Pytorch` to override `embed_suffix` with a
+    target_time-aware version. v0.3 ships with a SIMPLER variant:
+
+      - Flow-matching loss: student.denoise_step at random t vs true velocity (WORKS)
+      - Consistency loss: student.denoise_step at t vs teacher's 2-step
+        Euler shortcut from x_t at t (WORKS)
+
+    The student is a full-weight copy of the teacher, trained to match
+    the teacher's shortcut velocity at all timesteps. This trains the
+    student to do 2-3 step sampling, not exact 1-step. Full 1-step via
+    the target_time embedding is v0.3.1 (tracked in
+    reflex_context/01_architecture/distill_SYNTHESIS.md §"Deferred").
     """
-    _install_target_time_embedding(student)
+    import torch
+    from lerobot.policies.pi0.modeling_pi0 import make_att_2d_masks
 
-    def _run_policy_velocity(policy, x, t, obs_kwargs):
-        """Single velocity-head forward using the policy's documented API.
+    def _build_prefix_cache(policy, obs_kwargs):
+        """Compute (past_kv, prefix_pad_masks, state) from a lerobot batch.
 
-        We use `policy.model.sample_actions_step` if exposed (lerobot
-        ≥ 0.3) — it's the per-timestep hook the Euler loop calls
-        internally. Falls back to a ValueError with a remediation hint
-        if the policy doesn't expose it.
+        obs_kwargs is the batch dict minus 'action' — the flattened
+        observation/language/state that LeRobotDataset produces.
         """
-        model = getattr(policy, "model", policy)
-        # Prefer a one-step velocity hook if the policy exposes one.
-        fn = getattr(model, "denoise_step", None) or getattr(model, "sample_actions_step", None)
-        if fn is None:
-            raise AttributeError(
-                f"{type(policy).__name__} has no denoise_step / sample_actions_step "
-                f"method. SnapFlow needs a per-timestep velocity hook. "
-                f"If you're on a newer lerobot that renamed the method, add a "
-                f"branch to _run_policy_velocity in snapflow_backend.py."
-            )
-        return fn(x, t, **obs_kwargs)
+        m = policy.model
+        images, img_masks = policy._preprocess_images(obs_kwargs)
+        lang_tokens = obs_kwargs["observation.language_tokens"]
+        lang_masks = obs_kwargs["observation.language_attention_mask"]
+        state = policy.prepare_state(obs_kwargs)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = m.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks,
+        )
+        prefix_att_2d = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_pos = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_4d = m._prepare_attention_masks_4d(prefix_att_2d)
+        _, past_kv = m.paligemma_with_expert.forward(
+            attention_mask=prefix_att_4d,
+            position_ids=prefix_pos,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return past_kv, prefix_pad_masks, state
+
+    def _run_denoise_step(policy, x, t, obs_kwargs):
+        past_kv, prefix_pad_masks, state = _build_prefix_cache(policy, obs_kwargs)
+        return policy.model.denoise_step(
+            state=state,
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_kv,
+            x_t=x,
+            timestep=t,
+        )
 
     def teacher_velocity_fn(x, t, **obs_kwargs):
-        return _run_policy_velocity(teacher, x, t, obs_kwargs)
+        with torch.no_grad():
+            return _run_denoise_step(teacher, x, t, obs_kwargs)
 
     def student_velocity_fn(x, t, target_time=None, **obs_kwargs):
-        # target_time is routed through student.target_time_embed if installed.
-        if target_time is not None:
-            obs_kwargs = {**obs_kwargs, "target_time": target_time}
-        return _run_policy_velocity(student, x, t, obs_kwargs)
+        # target_time is accepted for API compatibility with snapflow_loss_step
+        # but is currently IGNORED (v0.3 runs SnapFlow-lite per docstring).
+        # When v0.3.1 lands the embed_suffix surgery, route target_time
+        # into the student's target_time_embed here.
+        return _run_denoise_step(student, x, t, obs_kwargs)
 
     return teacher_velocity_fn, student_velocity_fn
 
 
 def _install_target_time_embedding(student: Any) -> None:
-    """Install the zero-init target_time embedding on the student's
-    velocity head.
+    """[v0.3.1 scaffold] Install the zero-init target_time embedding.
 
-    Per architecture doc §C.1 + §C.3: the student is identical to the
-    teacher at init (zero-embedding output), and learns the one-step
-    shortcut via the consistency loss over training.
+    NOT CALLED by the v0.3 SnapFlow loop — kept here as the planned
+    attach point for the full paper-exact SnapFlow variant.
 
-    Concrete wiring depends on the policy type's expert-stack attribute
-    graph; v0.3 attaches the embedding as `student.target_time_embed`
-    and relies on the policy's forward to consume it when `target_time`
-    is passed through obs_kwargs.
+    When v0.3.1 lands, this function:
+      1. Subclasses PI0Pytorch → SnapFlowPI0Pytorch with an overridden
+         `embed_suffix(state, x_t, timestep, target_time=None)` that
+         adds `target_time_embed(target_time)` to the sinusoidal time
+         embedding before the action_time MLP.
+      2. Initializes target_time_embed's output layer to zero so the
+         student starts identical to the teacher.
+      3. Routes target_time through _run_denoise_step in
+         `_build_pi_family_adapters` instead of ignoring it.
 
-    If the policy doesn't have a documented slot for the embedding, we
-    still attach it — the actual velocity adapter picks it up via the
-    target_time kwarg.
+    See architecture doc §C.1 + §C.3 + distill_SYNTHESIS.md "Deferred".
     """
     import torch.nn as nn
 

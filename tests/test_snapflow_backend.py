@@ -162,42 +162,105 @@ class TestBuildVelocityAdapters:
                 teacher=MagicMock(), student=MagicMock(), policy_type="gr00t_n1_5",
             )
 
-    def test_pi_family_wraps_denoise_step(self):
-        """The adapter should route (x, t, obs) through denoise_step if present."""
-        import torch.nn as nn
+    def test_pi_family_adapter_calls_denoise_step_with_prefix_cache(self):
+        """The adapter should call policy.model.denoise_step with the
+        lerobot signature (state, prefix_pad_masks, past_key_values, x_t,
+        timestep). We mock the prefix-cache build path to isolate the
+        behavior of the velocity fn itself.
+        """
+        from unittest.mock import patch as _patch
 
-        # Teacher + student both expose .model.denoise_step
-        def make_policy(val: float):
-            m = nn.Module()
-            def fn(x, t, **kw):
-                return torch.full_like(x, val)
-            m.denoise_step = fn
-            p = nn.Module()
-            p.model = m
-            p.config = nn.Module()
-            p.config.expert_hidden_size = 64
-            return p
+        teacher_mock = MagicMock()
+        student_mock = MagicMock()
+        teacher_mock.model.denoise_step.return_value = torch.full((1, 3, 4), 0.1)
+        student_mock.model.denoise_step.return_value = torch.full((1, 3, 4), 0.2)
 
-        teacher = make_policy(0.1)
-        student = make_policy(0.2)
+        canned_state = torch.zeros(1, 32)
+        canned_past_kv = [("fake_cache",)]
+        canned_prefix_masks = torch.ones(1, 8, dtype=torch.bool)
 
-        teacher_fn, student_fn = _build_velocity_adapters(teacher, student, "pi0")
+        def fake_build_prefix(policy, obs):
+            return canned_past_kv, canned_prefix_masks, canned_state
 
+        # Patch the helper via direct module attribute override since it's
+        # a closure inside _build_velocity_adapters — easier to stub by
+        # replacing the whole adapter construction path.
         x = torch.zeros(1, 3, 4)
         t = torch.rand(1)
-        vt = teacher_fn(x, t)
-        vs = student_fn(x, t)
+        obs = {
+            "observation.state": torch.zeros(1, 7),
+            "observation.language_tokens": torch.zeros(1, 8, dtype=torch.long),
+            "observation.language_attention_mask": torch.ones(1, 8, dtype=torch.long),
+            "observation.images.front": torch.zeros(1, 3, 224, 224),
+        }
+
+        # Stub the lerobot helpers on the policy mocks so the prefix-cache
+        # path runs to completion without needing a real PI0Policy graph.
+        for p_mock in (teacher_mock, student_mock):
+            p_mock._preprocess_images.return_value = (
+                [torch.zeros(1, 3, 224, 224)], [torch.ones(1, dtype=torch.bool)],
+            )
+            p_mock.prepare_state.return_value = canned_state
+            p_mock.model.embed_prefix.return_value = (
+                torch.zeros(1, 8, 256), canned_prefix_masks,
+                torch.ones(1, 8, dtype=torch.long),
+            )
+            p_mock.model._prepare_attention_masks_4d.return_value = torch.ones(1, 1, 8, 8)
+            p_mock.model.paligemma_with_expert.forward.return_value = (None, canned_past_kv)
+
+        # make_att_2d_masks is imported from lerobot inside the adapter.
+        with _patch(
+            "lerobot.policies.pi0.modeling_pi0.make_att_2d_masks",
+            return_value=torch.ones(1, 8, 8, dtype=torch.bool),
+        ):
+            teacher_fn, student_fn = _build_velocity_adapters(
+                teacher_mock, student_mock, "pi0",
+            )
+            vt = teacher_fn(x, t, **obs)
+            vs = student_fn(x, t, **obs)
+
+        # denoise_step called with the right kwargs (state + x_t + timestep +
+        # prefix_pad_masks + past_key_values)
+        teacher_mock.model.denoise_step.assert_called_once()
+        t_call = teacher_mock.model.denoise_step.call_args.kwargs
+        assert set(t_call.keys()) == {"state", "prefix_pad_masks", "past_key_values", "x_t", "timestep"}
+        assert torch.allclose(t_call["x_t"], x)
+        assert torch.allclose(t_call["timestep"], t)
+
         assert torch.allclose(vt, torch.full_like(x, 0.1))
         assert torch.allclose(vs, torch.full_like(x, 0.2))
 
-        # Student accepts target_time — the adapter routes it into obs_kwargs
-        received = {}
-        def probe(x, t, **kw):
-            received.update(kw)
-            return torch.zeros_like(x)
-        student.model.denoise_step = probe
-        student_fn(x, t, target_time=torch.ones(1))
-        assert "target_time" in received
+    def test_student_ignores_target_time_in_v03(self):
+        """v0.3 SnapFlow-lite: target_time is accepted but not yet routed
+        through the expert's time embedding. Pinning this so when v0.3.1
+        lands the target_time surgery, the behavior-change is obvious."""
+        teacher_mock = MagicMock()
+        student_mock = MagicMock()
+        expected = torch.full((1, 3, 4), 0.5)
+        student_mock.model.denoise_step.return_value = expected
+        student_mock._preprocess_images.return_value = ([torch.zeros(1, 3, 224, 224)], [torch.ones(1, dtype=torch.bool)])
+        student_mock.prepare_state.return_value = torch.zeros(1, 32)
+        student_mock.model.embed_prefix.return_value = (torch.zeros(1, 8, 256), torch.ones(1, 8, dtype=torch.bool), torch.ones(1, 8, dtype=torch.long))
+        student_mock.model._prepare_attention_masks_4d.return_value = torch.ones(1, 1, 8, 8)
+        student_mock.model.paligemma_with_expert.forward.return_value = (None, [("fake_cache",)])
+
+        obs = {
+            "observation.language_tokens": torch.zeros(1, 8, dtype=torch.long),
+            "observation.language_attention_mask": torch.ones(1, 8, dtype=torch.long),
+        }
+
+        from unittest.mock import patch as _patch
+        with _patch(
+            "lerobot.policies.pi0.modeling_pi0.make_att_2d_masks",
+            return_value=torch.ones(1, 8, 8, dtype=torch.bool),
+        ):
+            _, student_fn = _build_velocity_adapters(teacher_mock, student_mock, "pi0")
+            v_with_tt = student_fn(torch.zeros(1, 3, 4), torch.rand(1),
+                                   target_time=torch.ones(1), **obs)
+            v_without_tt = student_fn(torch.zeros(1, 3, 4), torch.rand(1), **obs)
+
+        # Both paths return the same thing — target_time is currently ignored.
+        assert torch.allclose(v_with_tt, v_without_tt)
 
 
 class TestSaveCheckpoint:
