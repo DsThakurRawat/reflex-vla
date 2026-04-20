@@ -288,6 +288,13 @@ class TestBuildVelocityAdapters:
             )
             p_mock.model._prepare_attention_masks_4d.return_value = torch.ones(1, 1, 8, 8)
             p_mock.model.paligemma_with_expert.forward.return_value = (None, canned_past_kv)
+            # state_proj.weight.dtype is read for the state-dtype cast; set it
+            # to match canned_state so the cast is a no-op under mocks.
+            p_mock.model.state_proj.weight.dtype = canned_state.dtype
+            # Also stub _attn_implementation writeback (setattr on the nested
+            # language_model.config / gemma_expert.model.config paths).
+            p_mock.model.paligemma_with_expert.paligemma.model.language_model.config = MagicMock()
+            p_mock.model.paligemma_with_expert.gemma_expert.model.config = MagicMock()
 
         # make_att_2d_masks is imported from lerobot inside the adapter.
         with _patch(
@@ -320,10 +327,14 @@ class TestBuildVelocityAdapters:
         expected = torch.full((1, 3, 4), 0.5)
         student_mock.model.denoise_step.return_value = expected
         student_mock._preprocess_images.return_value = ([torch.zeros(1, 3, 224, 224)], [torch.ones(1, dtype=torch.bool)])
-        student_mock.prepare_state.return_value = torch.zeros(1, 32)
+        canned_state = torch.zeros(1, 32)
+        student_mock.prepare_state.return_value = canned_state
+        student_mock.model.state_proj.weight.dtype = canned_state.dtype
         student_mock.model.embed_prefix.return_value = (torch.zeros(1, 8, 256), torch.ones(1, 8, dtype=torch.bool), torch.ones(1, 8, dtype=torch.long))
         student_mock.model._prepare_attention_masks_4d.return_value = torch.ones(1, 1, 8, 8)
         student_mock.model.paligemma_with_expert.forward.return_value = (None, [("fake_cache",)])
+        student_mock.model.paligemma_with_expert.paligemma.model.language_model.config = MagicMock()
+        student_mock.model.paligemma_with_expert.gemma_expert.model.config = MagicMock()
 
         obs = {
             "observation.language.tokens": torch.zeros(1, 8, dtype=torch.long),
