@@ -91,7 +91,10 @@ image = (
         "rich",
     )
     .run_commands(
-        f"pip install 'reflex-vla @ git+https://github.com/rylinjames/reflex-vla@{_HEAD}'",
+        # [monolithic] extra pulls onnx-diagnostic + optree + scipy,
+        # which reflex.exporters.monolithic needs at import time for the
+        # auto-export chain that runs after training succeeds.
+        f"pip install 'reflex-vla[monolithic] @ git+https://github.com/rylinjames/reflex-vla@{_HEAD}'",
     )
     .env({
         "HF_HOME": HF_CACHE_PATH,
