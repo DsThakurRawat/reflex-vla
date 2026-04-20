@@ -401,21 +401,35 @@ def _build_pi_family_adapters(
 
     def _run_denoise_step(policy, x, t, obs_kwargs):
         # Monkey-patch lerobot's inner `copy.deepcopy(past_key_values)`
-        # for the duration of this call. In inference that deepcopy is a
-        # mutation safety-net, but under training it fails because
-        # past_kv contains graph-attached tensors (pytorch#103001).
-        # denoise_step calls paligemma_with_expert.forward with
-        # use_cache=False (modeling_pi0.py:924), so the forward doesn't
-        # mutate past_kv → deepcopy is defensive only, safe to skip.
+        # for the duration of this call (pytorch#103001 on graph-attached
+        # tensors). denoise_step calls paligemma_with_expert.forward with
+        # use_cache=False so past_kv is safe to not deepcopy.
+        # Also patch lerobot's explicit suffix_out.to(torch.float32) cast
+        # (modeling_pi0.py:930) — it assumes action_out_proj is fp32 even
+        # in bf16 inference, but we loaded everything in bf16 so the
+        # action_out_proj weights are bf16 too → dtype mismatch. Patch
+        # Tensor.to to no-op fp32 casts during the call.
         import lerobot.policies.pi0.modeling_pi0 as _pi0_mod
+        import torch
         _orig_deepcopy = _pi0_mod.copy.deepcopy
-        _pi0_mod.copy.deepcopy = lambda x: x
+        _pi0_mod.copy.deepcopy = lambda y: y
+        action_dtype = policy.model.action_in_proj.weight.dtype
+        _orig_tensor_to = torch.Tensor.to
+        def _patched_to(self, *args, **kwargs):
+            # Collapse requested fp32 casts down to the compute dtype so
+            # lerobot's hardcoded `.to(dtype=torch.float32)` in
+            # denoise_step doesn't break dtype consistency under bf16.
+            dtype = kwargs.get("dtype")
+            if dtype is None and args and isinstance(args[0], torch.dtype):
+                dtype = args[0]
+            if dtype is torch.float32 and action_dtype != torch.float32:
+                kwargs.pop("dtype", None)
+                args = tuple(a for a in args if a is not torch.float32)
+                return _orig_tensor_to(self, action_dtype, *args, **kwargs)
+            return _orig_tensor_to(self, *args, **kwargs)
+        torch.Tensor.to = _patched_to
         try:
             past_kv, prefix_pad_masks, state = _build_prefix_cache(policy, obs_kwargs)
-            # Action (x_t) should already be padded to max_action_dim in
-            # _prepare_batch so the whole flow-matching chain stays at the
-            # model's expected dim. Cast to action_in_proj dtype for safety.
-            action_dtype = policy.model.action_in_proj.weight.dtype
             if x.dtype != action_dtype:
                 x = x.to(action_dtype)
             return policy.model.denoise_step(
@@ -427,6 +441,7 @@ def _build_pi_family_adapters(
             )
         finally:
             _pi0_mod.copy.deepcopy = _orig_deepcopy
+            torch.Tensor.to = _orig_tensor_to
 
     def teacher_velocity_fn(x, t, **obs_kwargs):
         with torch.no_grad():
