@@ -163,10 +163,10 @@ class TestResolveBackend:
         with pytest.raises(NotImplementedError, match="v0.5"):
             resolve_backend(cfg)
 
-    def test_distill_snapflow_raises_module_not_found(self, tmp_path):
-        """SnapFlowBackend doesn't exist yet (Phase B). resolve_backend
-        should attempt to import it and bubble the ImportError, not
-        silently fall through to LerobotBackend."""
+    def test_distill_snapflow_returns_snapflow_backend(self, tmp_path):
+        """After Phase B 2/3, SnapFlowBackend exists — resolve_backend
+        should return an instance for phase='distill', method='snapflow'."""
+        from reflex.finetune.backends.snapflow_backend import SnapFlowBackend
         cfg = FinetuneConfig(
             base="lerobot/pi0_base",
             dataset="lerobot/libero",
@@ -174,7 +174,19 @@ class TestResolveBackend:
             phase="distill",
             distillation_method="snapflow",
         )
-        with pytest.raises(ImportError):
+        backend = resolve_backend(cfg)
+        assert isinstance(backend, SnapFlowBackend)
+
+    def test_distill_unsupported_method_raises(self, tmp_path):
+        """'consistency' is reserved for v0.5+ (GR00T DDPM)."""
+        cfg = FinetuneConfig(
+            base="lerobot/pi0_base",
+            dataset="lerobot/libero",
+            output=tmp_path,
+            phase="distill",
+            distillation_method="consistency",
+        )
+        with pytest.raises(NotImplementedError, match="v0.5"):
             resolve_backend(cfg)
 
     def test_unknown_phase_rejected(self, tmp_path):
