@@ -82,9 +82,17 @@ Per the synthesis doc, v0.3 is SmolVLA LoRA ONLY:
 
 All are architecturally hooked for (plugin registries already defined in `finetune_architecture.md` Section D); v0.5 wires them.
 
-## Honest caveats captured in measured_numbers row
+## Parity measurement LANDED (2026-04-20 late)
 
-- **Parity vs pre-fine-tune SmolVLA not yet measured** — pusht is single-cam single-task with 200 steps, so loss 0.688 doesn't tell us anything about task transfer. Only the structural soundness of the chain is proven.
+`scripts/modal_finetune_parity.py` — loads merged checkpoint + ONNX, runs shared seeded inputs. Result on v10:
+
+- first-action cos = **+1.000000**, max_abs = **2.98e-07**
+- full-chunk cos = **+1.000000**, max_abs = **2.26e-06**
+- VERDICT: **PASS**
+
+Actually TIGHTER than pre-fine-tune SmolVLA monolithic (which was 3.70e-06 full-chunk at num_steps=10). `reflex finetune` preserves cos=+1.0 through train → LoRA merge → monolithic ONNX. Row added as `2026-04-20-finetune-parity` in measured_numbers.md.
+
+## Honest caveats still remaining
 - **Modal image build overhead** — first run after Dockerfile change costs ~5 min of apt+pip. Steady-state finetune is ~1-2 min per 200 steps.
 - **Backend locked to lerobot-train via subprocess** — if lerobot 0.6 renames flags we re-hit the v1-v6 debug cycle. Thin orchestrator approach (competitive research "don't rewrite gradient math") keeps us honest but exposes us to upstream churn.
 
