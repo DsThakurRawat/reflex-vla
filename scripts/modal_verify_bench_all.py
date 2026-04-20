@@ -37,7 +37,7 @@ def run_all():
     print("=== Installing reflex-vla[serve,gpu] from git ===", flush=True)
     r = subprocess.run(
         ["pip", "install",
-         "reflex-vla[serve,gpu] @ git+https://github.com/rylinjames/reflex-vla"],
+         "reflex-vla[serve,gpu] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla"],
         capture_output=True, text=True, timeout=600,
     )
     if r.returncode != 0:

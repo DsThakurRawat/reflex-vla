@@ -63,7 +63,8 @@ image = (
         "rich",
     )
     .run_commands(
-        f"pip install 'reflex-vla @ git+https://github.com/rylinjames/reflex-vla@{_HEAD}'",
+        f"pip install 'reflex-vla @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla@{_HEAD}'",
+            secrets=[modal.Secret.from_name("github-token")],
     )
 )
 

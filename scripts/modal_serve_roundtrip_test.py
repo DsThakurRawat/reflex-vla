@@ -25,7 +25,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .pip_install(
-        "reflex-vla[serve,onnx] @ git+https://github.com/rylinjames/reflex-vla.git"
+        "reflex-vla[serve,onnx] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla.git"
     )
 )
 

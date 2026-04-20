@@ -65,7 +65,9 @@ image = (
         "num2words",
     )
     .run_commands(
-        f"pip install 'reflex-vla[monolithic] @ git+https://github.com/rylinjames/reflex-vla@{_HEAD}'",
+        # GITHUB_TOKEN from modal secret `github-token` (repo now private).
+        f"pip install 'reflex-vla[monolithic] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla@{_HEAD}'",
+        secrets=[modal.Secret.from_name("github-token")],
     )
     .env({
         "HF_HOME": HF_CACHE_PATH,

@@ -94,7 +94,10 @@ image = (
         # [monolithic] extra pulls onnx-diagnostic + optree + scipy,
         # which reflex.exporters.monolithic needs at import time for the
         # auto-export chain that runs after training succeeds.
-        f"pip install 'reflex-vla[monolithic] @ git+https://github.com/rylinjames/reflex-vla@{_HEAD}'",
+        # GITHUB_TOKEN injected from modal secret `github-token` because
+        # the repo is private.
+        f"pip install 'reflex-vla[monolithic] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla@{_HEAD}'",
+        secrets=[modal.Secret.from_name("github-token")],
     )
     .env({
         "HF_HOME": HF_CACHE_PATH,

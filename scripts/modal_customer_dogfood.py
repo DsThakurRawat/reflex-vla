@@ -61,7 +61,7 @@ image = (
         # SHA-pinning the install URL is what forces Modal to rebuild the image
         # when we commit — without this, the cached image from the previous dogfood
         # run is reused and the new fixes aren't actually tested.
-        f"pip install 'reflex-vla[serve,gpu,monolithic] @ git+https://github.com/rylinjames/reflex-vla@{_HEAD}'",
+        f"pip install 'reflex-vla[serve,gpu,monolithic] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla@{_HEAD}'",
     )
 )
 

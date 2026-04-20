@@ -1,7 +1,7 @@
 """Test that the README quickstart install path actually works on a fresh box.
 
 Spins up a clean Linux container, runs the EXACT command from README:
-  pip install 'reflex-vla[serve,gpu] @ git+https://github.com/rylinjames/reflex-vla'
+  pip install 'reflex-vla[serve,gpu] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla'
   reflex export lerobot/smolvla_base --target desktop --output ./sv
   reflex serve ./sv --port 8000 --device cuda
   curl -X POST http://localhost:8000/act ...
@@ -62,7 +62,7 @@ def test_fresh_install():
     # Step 1: pip install with the EXACT README command
     step(
         "1. pip install reflex-vla[serve,gpu] from git",
-        "pip install 'reflex-vla[serve,gpu] @ git+https://github.com/rylinjames/reflex-vla'",
+        "pip install 'reflex-vla[serve,gpu] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla'",
         timeout=600,
     )
 

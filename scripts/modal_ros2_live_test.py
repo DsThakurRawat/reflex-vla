@@ -54,7 +54,7 @@ image = (
         'echo "numpy>=1.24,<2.0" > /tmp/reflex_cons.txt',
     )
     .pip_install(
-        "reflex-vla[serve,onnx] @ git+https://github.com/rylinjames/reflex-vla.git",
+        "reflex-vla[serve,onnx] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla.git",
         extra_options="-c /tmp/reflex_cons.txt",
     )
     .env({
