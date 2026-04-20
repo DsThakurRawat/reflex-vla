@@ -46,6 +46,44 @@ _SNAPFLOW_PI0_CLASS: Any = None
 _SNAPFLOW_PI05_CLASS: Any = None
 
 
+def _detach_kv_cache_deep(past_kv: Any) -> Any:
+    """Walk a KV cache and detach every tensor found, in place.
+
+    Used by SnapFlowPI05Pytorch.denoise_step before a ``copy.deepcopy``
+    that would otherwise raise on graph-attached tensors (pytorch#103001).
+    Returns the same object with tensors detached.
+
+    Handles:
+      - bare tuples / lists / dicts
+      - HF DynamicCache (key_cache + value_cache attrs)
+      - any object with a __dict__ containing nested tensors
+    """
+    import torch
+
+    def _walk(obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.detach()
+        if isinstance(obj, list):
+            return [_walk(x) for x in obj]
+        if isinstance(obj, tuple):
+            return tuple(_walk(x) for x in obj)
+        if isinstance(obj, dict):
+            return {k: _walk(v) for k, v in obj.items()}
+        for attr in ("key_cache", "value_cache", "key_states", "value_states"):
+            if hasattr(obj, attr):
+                try:
+                    setattr(obj, attr, _walk(getattr(obj, attr)))
+                except AttributeError:
+                    pass  # read-only property
+        if hasattr(obj, "__dict__"):
+            for k, v in list(obj.__dict__.items()):
+                if isinstance(v, (torch.Tensor, list, tuple, dict)):
+                    obj.__dict__[k] = _walk(v)
+        return obj
+
+    return _walk(past_kv)
+
+
 def enable_snapflow(model: Any) -> None:
     """Mutate a pi-family Pytorch instance in place so it supports target_time.
 
@@ -450,12 +488,26 @@ def _resolve_snapflow_pi05_class() -> type:
             target_time=None,
             state=None,  # accepted for API compat with pi0 path; ignored
         ):
-            """Parent denoise_step minus the deepcopy and minus the fp32 cast.
+            """Parent denoise_step minus the fp32 cast; with DETACHED past_kv.
+
+            Unlike the pi0 override (which keeps past_kv graph-attached so
+            VLM gradients flow to the student), pi0.5's
+            ``paligemma_with_expert.forward`` needs ``past_key_values`` in a
+            state the DynamicCache can inspect — in practice this means it
+            must be re-parseable as a cache object, which requires going
+            through a ``copy.deepcopy`` that fails on graph-attached
+            tensors (pytorch#103001).
+
+            Workaround: detach-in-place + deepcopy before the forward.
+            Consequence: pi0.5 student trains action expert + projections +
+            target_time_embed_mlp, but VLM weights stay frozen (same as
+            pi0 in v0.3 pre-v0.3.1). Full-VLM training is v0.3.2 work.
 
             ``state`` kwarg is accepted for cross-family API compatibility
-            with the pi0 adapter's ``_run_denoise_step`` but is unused —
-            pi0.5 doesn't put state in the suffix embedding.
+            but unused — pi0.5 doesn't put state in the suffix embedding.
             """
+            import copy
+
             suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
                 x_t, timestep, target_time=target_time,
             )
@@ -477,6 +529,11 @@ def _resolve_snapflow_pi05_class() -> type:
 
             full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
             self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+
+            # Detach past_kv tensors so deepcopy succeeds on graph-attached
+            # cache objects. Walks the cache recursively.
+            past_key_values = _detach_kv_cache_deep(past_key_values)
+            past_key_values = copy.deepcopy(past_key_values)
 
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=full_att_2d_masks_4d,
