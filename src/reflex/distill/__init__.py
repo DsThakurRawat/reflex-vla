@@ -1,36 +1,75 @@
-"""VLA distillation (DMPO one-step generation recipe).
+"""VLA distillation — SnapFlow 1-step self-distillation for flow-matching VLAs.
 
-Full training pipeline ships in v0.2.1+. This module scaffolds the
-architectural surface so `reflex distill` is wired into the CLI and the
-recipe-loading pattern is established.
+v0.3: SnapFlow only (pi0 + pi0.5). See `reflex_context/01_architecture/
+distill_SYNTHESIS.md` for the scope decision.
 
-DMPO (arXiv 2601.20701): One-step MeanFlow Policy with dispersive
-regularization. Strictly better than pi-Flow for robot action distillation
-because it eliminates the teacher-model dependency while achieving
-single-step inference at 1770 Hz on consumer GPUs.
+## What's in v0.3
 
-Pipeline:
-    reflex distill <teacher_export> --output <student_export>
-        -> train DMPO student on LIBERO/DROID trajectories
-        -> export student to ONNX (reuses existing exporters)
-        -> validate student vs teacher (uses existing validate harness)
+- `snapflow.py` — SnapFlow loss math (flow-matching + consistency +
+  zero-init target-time embedding). Unit-testable without GPU.
+- `teacher_loader.py` — load teacher PyTorch policy from reflex-export
+  dir; freeze + eval. (Phase B deliverable.)
+
+## What's DEPRECATED from v0.2
+
+- `pi_flow.py` — moved to `archive/v0.2/distill/pi_flow.py`. Scope
+  decision rejected pi-Flow in favor of SnapFlow (better 1-NFE
+  quality on VLAs per Luan et al. 2604.05656).
+- `dmpo.py` — moved to `archive/v0.2/distill/dmpo.py`. DMPO turned out
+  to be RL+MeanFlow, not knowledge distillation. Different product
+  line; may return as `phase=rl` in v0.5+.
+
+## Public API
+
+Use `reflex finetune --phase distill` (the new CLI entry). The
+trainer is selected by `distillation_method` in FinetuneConfig;
+v0.3 supports only `"snapflow"`.
 """
 from __future__ import annotations
 
-__all__ = ["get_recipe"]
+__all__ = ["get_method"]
 
 
-def get_recipe(name: str):
-    """Load a distillation recipe by name.
+# v0.3 method registry. Extend (NOT replace) when v0.5+ adds Consistency
+# Policy for GR00T DDPM.
+_SUPPORTED_METHODS: dict[str, str] = {
+    "snapflow": "reflex.distill.snapflow",
+}
 
-    Available recipes:
-        dmpo - MeanFlow one-step distillation (arXiv 2601.20701)
-        pi_flow - 10→2 step velocity-field matching (arXiv 2510.14974)
+_DEPRECATED: dict[str, str] = {
+    "dmpo": (
+        "DMPO is deprecated in v0.3. It was RL+MeanFlow, not knowledge "
+        "distillation — different product line. Archived to "
+        "archive/v0.2/distill/dmpo.py. If you want RL-style policy "
+        "optimization, watch for `phase=rl` in v0.5+."
+    ),
+    "pi_flow": (
+        "pi_flow is deprecated in v0.3. Scope decision picked SnapFlow "
+        "instead (better 1-NFE quality on real VLAs per arxiv "
+        "2604.05656). Archived to archive/v0.2/distill/pi_flow.py."
+    ),
+    "consistency": (
+        "Consistency Policy (DDPM distillation for GR00T) is deferred "
+        "to v0.5+, conditional on the Eagle VLM TRT-on-Jetson goal "
+        "landing first (GR00T denoise is only 35% of E2E latency; "
+        "VLM dominates — see distill_SYNTHESIS.md)."
+    ),
+}
+
+
+def get_method(name: str):
+    """Resolve a distillation-method name to its module.
+
+    Raises ValueError with an actionable message for deprecated or
+    unknown names. See `distill_SYNTHESIS.md` for the scope context.
     """
-    if name == "dmpo":
-        from reflex.distill.dmpo import DMPOTrainer
-        return DMPOTrainer
-    if name == "pi_flow":
-        from reflex.distill.pi_flow import PiFlowTrainer
-        return PiFlowTrainer
-    raise ValueError(f"Unknown distillation recipe: {name!r}. Try 'dmpo' or 'pi_flow'.")
+    if name in _SUPPORTED_METHODS:
+        import importlib
+        return importlib.import_module(_SUPPORTED_METHODS[name])
+    if name in _DEPRECATED:
+        raise ValueError(f"method={name!r}: {_DEPRECATED[name]}")
+    raise ValueError(
+        f"Unknown distillation method: {name!r}. Supported in v0.3: "
+        f"{sorted(_SUPPORTED_METHODS)}. "
+        f"See reflex_context/01_architecture/distill_SYNTHESIS.md."
+    )
