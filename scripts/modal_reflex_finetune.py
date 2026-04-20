@@ -75,6 +75,11 @@ image = (
         "peft>=0.10",
         "accelerate>=0.30",
         "datasets>=2.15",
+        # SmolVLM's processor requires num2words at import time; lerobot
+        # doesn't pull it transitively. Without this the policy load
+        # fails with "Package num2words is required to run SmolVLM
+        # processor." (v6 smoke test failure mode).
+        "num2words",
         "typer",
         "rich",
     )
