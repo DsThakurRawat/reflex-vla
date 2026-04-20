@@ -71,6 +71,21 @@ class FinetuneConfig:
     or gated-repo flows where preflight can't resolve the schema.
     Only set if you know what you're doing."""
 
+    phase: str = "train"
+    """One of: 'train' | 'distill'.
+    - 'train' (default, v0.3): fine-tune via lerobot-train subprocess
+    - 'distill' (v0.3+): SnapFlow distillation. Requires teacher_export.
+    Routed to backends via reflex.finetune.backends.resolve_backend()."""
+
+    teacher_export: str | None = None
+    """For phase='distill' only: path/HF-id of the teacher's reflex-
+    export dir (merged PyTorch checkpoint). None for phase='train'."""
+
+    distillation_method: str = "snapflow"
+    """For phase='distill' only: which distillation trainer to use.
+    v0.3 supports 'snapflow' only. 'consistency' (DDPM for GR00T)
+    lands in v0.5+."""
+
     def __post_init__(self) -> None:
         self.output = Path(self.output)
 
