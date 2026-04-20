@@ -41,12 +41,29 @@ construction, etc.). So this module splits:
     expert-stack. Lazy-imported per-policy-type so CI can test
     the generic loop without lerobot installed.
 
-v0.3: pi0 + pi05 only. SmolVLA is v0.3.1 pending velocity-convergence
-validation; GR00T is v0.5+ (different denoising paradigm — DDPM).
+## v0.3.1 (target_time properly wired)
+
+pi0/pi05 teacher + student are mutated in place by
+`reflex.distill.snapflow_pi0_model.enable_snapflow()`. This swaps
+`__class__` to SnapFlowPI0Pytorch and attaches a zero-init learnable
+`target_time_embed_mlp`. Downstream effect:
+
+  - `student.model.embed_suffix(..., target_time=tensor)` adds the
+    learned contribution to the time embedding, so consistency loss
+    at target_time=1 is semantically meaningful.
+  - `student.model.denoise_step` skips `copy.deepcopy(past_kv)` (safe
+    because downstream forward uses `use_cache=False`) and skips the
+    hardcoded `fp32` cast (uses `action_out_proj.weight.dtype`).
+  - Past KV cache stays graph-attached → VLM receives gradients.
+
+Dataset now uses `delta_timestamps={ACTION: [i/fps for i in range(chunk_size)]}`
+so LeRobotDataset yields real action chunks instead of single-frame tiles.
+
+v0.3.1: pi0 + pi05. SmolVLA pending velocity-convergence validation;
+GR00T is v0.5+ (different denoising paradigm — DDPM).
 """
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import math
@@ -117,16 +134,32 @@ class SnapFlowBackend:
             p.requires_grad = True
         student.train()
 
-        # ---- 2. Install velocity adapters + target_time embedding ----------
+        # ---- 2. Enable SnapFlow overrides on both teacher + student --------
+        # pi0/pi05: swap __class__ to SnapFlowPI0Pytorch and attach zero-init
+        # target_time_embed_mlp. This replaces three v0.3 monkey-patches:
+        # deepcopy-free past_kv, no hardcoded fp32 cast, target_time support.
+        # Teacher's target_time_embed_mlp stays zero + frozen (we never pass
+        # target_time to teacher, so the contribution is 0 either way).
+        if policy_type in ("pi0", "pi05"):
+            from reflex.distill.snapflow_pi0_model import enable_snapflow
+            enable_snapflow(teacher.model)
+            enable_snapflow(student.model)
+            for p in teacher.model.target_time_embed_mlp.parameters():
+                p.requires_grad = False
+
+        # ---- 3. Install velocity adapters ---------------------------------
         teacher_velocity_fn, student_velocity_fn = _build_velocity_adapters(
             teacher=teacher,
             student=student,
             policy_type=policy_type,
         )
 
-        # ---- 3. Build dataloader + preprocessor ---------------------------
+        # ---- 4. Build dataloader + preprocessor ---------------------------
+        chunk_size_cfg = getattr(teacher.config, "chunk_size", None)
         try:
-            loader = _build_dataloader(cfg, policy_type=policy_type)
+            loader = _build_dataloader(
+                cfg, policy_type=policy_type, chunk_size=chunk_size_cfg,
+            )
         except Exception as e:
             return CheckpointResult(
                 final_checkpoint_path=Path(cfg.output),
@@ -148,7 +181,7 @@ class SnapFlowBackend:
                 error=f"preprocessor construction failed: {type(e).__name__}: {e}",
             )
 
-        # ---- 4. Optimizer + checkpoint dir --------------------------------
+        # ---- 5. Optimizer + checkpoint dir --------------------------------
         opt = AdamW(
             (p for p in student.parameters() if p.requires_grad),
             lr=cfg.learning_rate,
@@ -162,10 +195,10 @@ class SnapFlowBackend:
             cfg.extra_lerobot_args.get("consistency_alpha", DEFAULT_CONSISTENCY_ALPHA)
         )
 
-        # ---- 5. Fire on_start ---------------------------------------------
+        # ---- 6. Fire on_start ---------------------------------------------
         ctx.hooks.run("on_start", ctx, config=cfg, policy_type=policy_type)
 
-        # ---- 6. Training loop ---------------------------------------------
+        # ---- 7. Training loop ---------------------------------------------
         step = 0
         last_ckpt: Path | None = None
         loss_history: list[dict[str, float]] = []
@@ -229,13 +262,13 @@ class SnapFlowBackend:
         finally:
             log_handle.close()
 
-        # ---- 7. Ensure we have a final checkpoint -------------------------
+        # ---- 8. Ensure we have a final checkpoint -------------------------
         if last_ckpt is None:
             last_ckpt = _save_student_checkpoint(
                 student, checkpoint_root, step or 0, teacher_config=loaded.config,
             )
 
-        # ---- 8. Provenance stamp ------------------------------------------
+        # ---- 9. Provenance stamp ------------------------------------------
         _write_provenance(
             last_ckpt,
             teacher_dir=loaded.checkpoint_dir,
@@ -244,7 +277,7 @@ class SnapFlowBackend:
             consistency_alpha=consistency_alpha,
         )
 
-        # ---- 9. Fire on_end + return --------------------------------------
+        # ---- 10. Fire on_end + return -------------------------------------
         ctx.hooks.run(
             "on_end", ctx, status="ok", steps_completed=step,
         )
@@ -278,8 +311,9 @@ def _build_velocity_adapters(
         teacher_velocity_fn(x, t, **obs_kwargs) -> velocity tensor
         student_velocity_fn(x, t, target_time=None, **obs_kwargs) -> velocity tensor
 
-    The student's `target_time` routes through the zero-init embedding
-    installed by `_install_target_time_embedding`.
+    The student's `target_time` routes through the zero-init
+    `target_time_embed_mlp` attached by
+    `reflex.distill.snapflow_pi0_model.enable_snapflow()`.
 
     Raises NotImplementedError for policy_types we haven't wired yet
     (SmolVLA v0.3.1; GR00T v0.5+).
@@ -317,22 +351,25 @@ def _build_pi_family_adapters(
     during training each step uses a fresh batch so there's nothing to
     cache across steps anyway.
 
-    ## target_time is NOT yet wired
+    ## target_time wiring (v0.3.1)
 
-    SnapFlow's exact paper trick — a zero-init `target_time` embedding
-    added to the time embedding inside `embed_suffix` — requires
-    subclassing `PI0Pytorch` to override `embed_suffix` with a
-    target_time-aware version. v0.3 ships with a SIMPLER variant:
+    The SnapFlow paper trick — a zero-init `target_time` embedding added
+    to the time embedding inside `embed_suffix` — is now live via
+    `reflex.distill.snapflow_pi0_model.enable_snapflow()`. After that
+    call, `student.model.embed_suffix(..., target_time=tensor)` adds
+    the learned contribution before the action_time MLP fuses it with
+    the action embedding.
 
-      - Flow-matching loss: student.denoise_step at random t vs true velocity (WORKS)
-      - Consistency loss: student.denoise_step at t vs teacher's 2-step
-        Euler shortcut from x_t at t (WORKS)
+    Loss components:
+      - Flow-matching: student.denoise_step at random t (target_time=None)
+        vs the analytic velocity `u_t = noise - action`.
+      - Consistency: student.denoise_step at t with target_time=1 vs the
+        teacher's 2-step Euler shortcut from x_t. This trains the student
+        to produce the 2-step shortcut velocity in one forward pass at
+        target_time=1, which is the SnapFlow 1-NFE inference mode.
 
-    The student is a full-weight copy of the teacher, trained to match
-    the teacher's shortcut velocity at all timesteps. This trains the
-    student to do 2-3 step sampling, not exact 1-step. Full 1-step via
-    the target_time embedding is v0.3.1 (tracked in
-    reflex_context/01_architecture/distill_SYNTHESIS.md §"Deferred").
+    Zero-init on `target_time_embed_mlp.output` means student == teacher
+    at init; the consistency loss drives the learned offset.
     """
     import torch
     import torch.nn.functional as F
@@ -387,183 +424,45 @@ def _build_pi_family_adapters(
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
-        # lerobot's denoise_step does `past_key_values = copy.deepcopy(past_kv)`
-        # internally (modeling_pi0.py:918). Deepcopy of autograd-attached
-        # tensors raises "Only Tensors created explicitly by the user
-        # support the deepcopy protocol" (pytorch#103001). Detach each
-        # layer's tensors so deepcopy succeeds.
-        # v0.3 consequence: VLM prefix doesn't receive student gradients —
-        # only the action expert + state/action projections train. The
-        # paper-exact SnapFlow trains all weights; we defer full-model
-        # gradient flow to v0.3.1 alongside the target_time surgery.
-        past_kv = _detach_kv_cache(past_kv)
+        # SnapFlowPI0Pytorch.denoise_step skips the `copy.deepcopy(past_kv)`
+        # that the stock lerobot path does (modeling_pi0.py:918), so we no
+        # longer need to detach past_kv tensors. Student path now keeps
+        # past_kv graph-attached → VLM receives gradients.
         return past_kv, prefix_pad_masks, state
 
-    def _run_denoise_step(policy, x, t, obs_kwargs):
-        # Monkey-patch lerobot's inner `copy.deepcopy(past_key_values)`
-        # for the duration of this call (pytorch#103001 on graph-attached
-        # tensors). denoise_step calls paligemma_with_expert.forward with
-        # use_cache=False so past_kv is safe to not deepcopy.
-        # Also patch lerobot's explicit suffix_out.to(torch.float32) cast
-        # (modeling_pi0.py:930) — it assumes action_out_proj is fp32 even
-        # in bf16 inference, but we loaded everything in bf16 so the
-        # action_out_proj weights are bf16 too → dtype mismatch. Patch
-        # Tensor.to to no-op fp32 casts during the call.
-        import lerobot.policies.pi0.modeling_pi0 as _pi0_mod
-        import torch
-        _orig_deepcopy = _pi0_mod.copy.deepcopy
-        _pi0_mod.copy.deepcopy = lambda y: y
+    def _run_denoise_step(policy, x, t, obs_kwargs, target_time=None):
+        """Compute velocity via denoise_step.
+
+        Requires ``enable_snapflow()`` to have been called on ``policy.model``
+        (SnapFlowBackend does this at load time). That override removes the
+        deepcopy + fp32-cast monkey-patches the stock lerobot path needed.
+        """
         action_dtype = policy.model.action_in_proj.weight.dtype
-        _orig_tensor_to = torch.Tensor.to
-        def _patched_to(self, *args, **kwargs):
-            # Collapse requested fp32 casts down to the compute dtype so
-            # lerobot's hardcoded `.to(dtype=torch.float32)` in
-            # denoise_step doesn't break dtype consistency under bf16.
-            dtype = kwargs.get("dtype")
-            if dtype is None and args and isinstance(args[0], torch.dtype):
-                dtype = args[0]
-            if dtype is torch.float32 and action_dtype != torch.float32:
-                kwargs.pop("dtype", None)
-                args = tuple(a for a in args if a is not torch.float32)
-                return _orig_tensor_to(self, action_dtype, *args, **kwargs)
-            return _orig_tensor_to(self, *args, **kwargs)
-        torch.Tensor.to = _patched_to
-        try:
-            past_kv, prefix_pad_masks, state = _build_prefix_cache(policy, obs_kwargs)
-            if x.dtype != action_dtype:
-                x = x.to(action_dtype)
-            return policy.model.denoise_step(
-                state=state,
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_kv,
-                x_t=x,
-                timestep=t,
-            )
-        finally:
-            _pi0_mod.copy.deepcopy = _orig_deepcopy
-            torch.Tensor.to = _orig_tensor_to
+        past_kv, prefix_pad_masks, state = _build_prefix_cache(policy, obs_kwargs)
+        if x.dtype != action_dtype:
+            x = x.to(action_dtype)
+        return policy.model.denoise_step(
+            state=state,
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_kv,
+            x_t=x,
+            timestep=t,
+            target_time=target_time,
+        )
 
     def teacher_velocity_fn(x, t, **obs_kwargs):
         with torch.no_grad():
-            return _run_denoise_step(teacher, x, t, obs_kwargs)
+            return _run_denoise_step(teacher, x, t, obs_kwargs, target_time=None)
 
     def student_velocity_fn(x, t, target_time=None, **obs_kwargs):
-        # target_time is accepted for API compatibility with snapflow_loss_step
-        # but is currently IGNORED (v0.3 runs SnapFlow-lite per docstring).
-        # When v0.3.1 lands the embed_suffix surgery, route target_time
-        # into the student's target_time_embed here.
-        return _run_denoise_step(student, x, t, obs_kwargs)
+        return _run_denoise_step(student, x, t, obs_kwargs, target_time=target_time)
 
     return teacher_velocity_fn, student_velocity_fn
-
-
-def _install_target_time_embedding(student: Any) -> None:
-    """[v0.3.1 scaffold] Install the zero-init target_time embedding.
-
-    NOT CALLED by the v0.3 SnapFlow loop — kept here as the planned
-    attach point for the full paper-exact SnapFlow variant.
-
-    When v0.3.1 lands, this function:
-      1. Subclasses PI0Pytorch → SnapFlowPI0Pytorch with an overridden
-         `embed_suffix(state, x_t, timestep, target_time=None)` that
-         adds `target_time_embed(target_time)` to the sinusoidal time
-         embedding before the action_time MLP.
-      2. Initializes target_time_embed's output layer to zero so the
-         student starts identical to the teacher.
-      3. Routes target_time through _run_denoise_step in
-         `_build_pi_family_adapters` instead of ignoring it.
-
-    See architecture doc §C.1 + §C.3 + distill_SYNTHESIS.md "Deferred".
-    """
-    import torch.nn as nn
-
-    from reflex.distill.snapflow import ZeroInitTargetTimeEmbedding
-
-    # Try to infer embedding_dim from the model config. pi0/pi05 both
-    # have an action_expert with hidden_size.
-    emb_dim = _infer_time_embedding_dim(student)
-    embed = ZeroInitTargetTimeEmbedding(embedding_dim=emb_dim)
-    # Attach mlp as a submodule so optimizer.step() updates it.
-    if hasattr(student, "target_time_embed"):
-        logger.warning(
-            "[snapflow] student already has target_time_embed; overwriting"
-        )
-    # `embed` is a vanilla Python class holding an nn.Sequential; register
-    # the inner module so it's tracked by student.parameters().
-    if isinstance(student, nn.Module):
-        student.add_module("target_time_embed_mlp", embed.mlp)
-    student.target_time_embed = embed
-
-
-def _infer_time_embedding_dim(model: Any) -> int:
-    """Best-effort: infer the time-embedding hidden size from the model.
-
-    pi0/pi05 typically have an `action_expert` or `expert` attribute with
-    a hidden_size in its config. We fall back to 1024 (pi0-base default)
-    if we can't find it, rather than crashing — the zero-init means the
-    student behaves as teacher-identical regardless, so a wrong dim only
-    matters once training has progressed (when the bug will be obvious).
-    """
-    for attr_path in (
-        ("config", "expert_hidden_size"),
-        ("config", "action_expert_hidden_size"),
-        ("model", "config", "expert_hidden_size"),
-        ("action_expert", "config", "hidden_size"),
-    ):
-        cur = model
-        try:
-            for name in attr_path:
-                cur = getattr(cur, name)
-            if isinstance(cur, int) and cur > 0:
-                return cur
-        except AttributeError:
-            continue
-    logger.warning(
-        "[snapflow] could not infer time-embedding dim from model; "
-        "defaulting to 1024 (pi0-base convention)",
-    )
-    return 1024
 
 
 # ---------------------------------------------------------------------------
 # Dataloader + batch prep
 # ---------------------------------------------------------------------------
-
-def _detach_kv_cache(past_kv):
-    """Detach every tensor in a transformer KV cache so downstream
-    `copy.deepcopy(past_kv)` (as done by lerobot's denoise_step at line
-    918 of modeling_pi0.py) doesn't fail on graph-attached tensors.
-
-    past_kv format varies across transformers versions and can nest
-    list / tuple / dict / custom-object. Walk recursively and detach
-    any tensor found, regardless of container type.
-    """
-    import torch
-    def _walk(obj):
-        if isinstance(obj, torch.Tensor):
-            return obj.detach()
-        if isinstance(obj, list):
-            return [_walk(x) for x in obj]
-        if isinstance(obj, tuple):
-            return tuple(_walk(x) for x in obj)
-        if isinstance(obj, dict):
-            return {k: _walk(v) for k, v in obj.items()}
-        # For HF DynamicCache-like objects, walk the known slots AND any
-        # mutable __dict__ attrs that might hold tensors.
-        for attr in ("key_cache", "value_cache", "key_states", "value_states"):
-            if hasattr(obj, attr):
-                try:
-                    setattr(obj, attr, _walk(getattr(obj, attr)))
-                except AttributeError:
-                    pass  # read-only property on some cache classes
-        # Last resort: walk __dict__ if present.
-        if hasattr(obj, "__dict__"):
-            for k, v in list(obj.__dict__.items()):
-                if isinstance(v, (torch.Tensor, list, tuple, dict)):
-                    obj.__dict__[k] = _walk(v)
-        return obj
-    return _walk(past_kv)
-
 
 def _build_preprocessor(
     *,
@@ -601,16 +500,35 @@ def _build_preprocessor(
     )
 
 
-def _build_dataloader(cfg, *, policy_type: str):
+def _build_dataloader(cfg, *, policy_type: str, chunk_size: int | None = None):
     """Build a LeRobotDataset dataloader for the distillation run.
+
+    When ``chunk_size`` is given, configures ``delta_timestamps`` so the
+    dataset yields real ``(B, chunk_size, action_dim)`` action chunks
+    (i.e. the 50 future actions pi0 expects to predict in one shot).
+    fps is read from LeRobotDatasetMetadata.
 
     Lazy-imports lerobot.datasets so CI without lerobot installed can
     still test the rest of the loop.
     """
     import torch
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.lerobot_dataset import (
+        LeRobotDataset,
+        LeRobotDatasetMetadata,
+    )
+    from lerobot.utils.constants import ACTION
 
-    dataset = LeRobotDataset(cfg.dataset)
+    delta_timestamps = None
+    if chunk_size is not None and chunk_size > 1:
+        meta = LeRobotDatasetMetadata(cfg.dataset)
+        fps = meta.fps
+        delta_timestamps = {ACTION: [i / fps for i in range(chunk_size)]}
+        logger.info(
+            "[snapflow] delta_timestamps: ACTION chunk_size=%d @ fps=%d",
+            chunk_size, fps,
+        )
+
+    dataset = LeRobotDataset(cfg.dataset, delta_timestamps=delta_timestamps)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=cfg.batch_size,
@@ -653,12 +571,17 @@ def _prepare_batch(
         action = action.to(device)
     if compute_dtype is not None and action.dtype != compute_dtype:
         action = action.to(compute_dtype)
-    # pi0/pi05 training expects (B, chunk_size, action_dim) — if the dataset
-    # returns (B, action_dim) single-step (no delta_timestamps configured),
-    # tile across chunk_size so the flow-matching chain has a time axis.
-    # This is a smoke-test shortcut; production distill should configure
-    # delta_timestamps on LeRobotDataset for a real action chunk.
+    # pi0/pi05 training expects (B, chunk_size, action_dim). The dataloader
+    # configures delta_timestamps so LeRobotDataset yields a real chunk,
+    # but older smoke paths / non-delta_timestamps datasets may still
+    # deliver a single frame — fall back to tiling in that case.
     if chunk_size is not None and action.ndim == 2:
+        logger.warning(
+            "[snapflow] dataset delivered single-step action (ndim=2); "
+            "tiling across chunk_size=%d — configure delta_timestamps "
+            "on the dataset for a real action chunk.",
+            chunk_size,
+        )
         action = action.unsqueeze(1).expand(-1, chunk_size, -1).contiguous()
     if max_action_dim is not None and action.shape[-1] < max_action_dim:
         action = F.pad(action, (0, max_action_dim - action.shape[-1]))

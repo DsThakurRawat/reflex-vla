@@ -33,7 +33,6 @@ from reflex.finetune.backends.snapflow_backend import (
     SnapFlowBackend,
     _build_preprocessor,
     _build_velocity_adapters,
-    _infer_time_embedding_dim,
     _prepare_batch,
     _save_student_checkpoint,
     _write_provenance,
@@ -176,18 +175,6 @@ class TestPrepareBatch:
         assert not torch.allclose(n1, n2)
 
 
-class TestInferTimeEmbeddingDim:
-    def test_via_config_expert_hidden_size(self):
-        model = MagicMock(spec=["config"])
-        model.config = MagicMock(spec=["expert_hidden_size"])
-        model.config.expert_hidden_size = 768
-        assert _infer_time_embedding_dim(model) == 768
-
-    def test_fallback_to_1024_when_unknown(self):
-        model = object()  # no attrs
-        assert _infer_time_embedding_dim(model) == 1024
-
-
 class TestBuildPreprocessor:
     def test_overrides_rename_map_and_device(self, tmp_path):
         """_build_preprocessor should inject the image_key_map into the
@@ -311,31 +298,43 @@ class TestBuildVelocityAdapters:
             vs = student_fn(x, t, **obs)
 
         # denoise_step called with the right kwargs (state + x_t + timestep +
-        # prefix_pad_masks + past_key_values)
+        # prefix_pad_masks + past_key_values + target_time). Teacher path
+        # always passes target_time=None (inference-like semantics).
         teacher_mock.model.denoise_step.assert_called_once()
         t_call = teacher_mock.model.denoise_step.call_args.kwargs
-        assert set(t_call.keys()) == {"state", "prefix_pad_masks", "past_key_values", "x_t", "timestep"}
+        assert set(t_call.keys()) == {
+            "state", "prefix_pad_masks", "past_key_values",
+            "x_t", "timestep", "target_time",
+        }
         assert torch.allclose(t_call["x_t"], x)
         assert torch.allclose(t_call["timestep"], t)
+        assert t_call["target_time"] is None
 
         assert torch.allclose(vt, torch.full_like(x, 0.1))
         assert torch.allclose(vs, torch.full_like(x, 0.2))
 
-    def test_student_ignores_target_time_in_v03(self):
-        """v0.3 SnapFlow-lite: target_time is accepted but not yet routed
-        through the expert's time embedding. Pinning this so when v0.3.1
-        lands the target_time surgery, the behavior-change is obvious."""
+    def test_student_passes_target_time_through_denoise_step(self):
+        """v0.3.1 SnapFlowPI0Pytorch: target_time is now routed through
+        denoise_step → embed_suffix → target_time_embed_mlp. The backend
+        adapter just forwards the kwarg; the semantic effect lives in
+        SnapFlowPI0Pytorch itself (covered by test_snapflow_pi0_model)."""
         teacher_mock = MagicMock()
         student_mock = MagicMock()
         expected = torch.full((1, 3, 4), 0.5)
         student_mock.model.denoise_step.return_value = expected
-        student_mock._preprocess_images.return_value = ([torch.zeros(1, 3, 224, 224)], [torch.ones(1, dtype=torch.bool)])
+        student_mock._preprocess_images.return_value = (
+            [torch.zeros(1, 3, 224, 224)], [torch.ones(1, dtype=torch.bool)],
+        )
         canned_state = torch.zeros(1, 32)
         student_mock.prepare_state.return_value = canned_state
         student_mock.model.state_proj.weight.dtype = canned_state.dtype
         student_mock.model.action_in_proj.weight.dtype = torch.float32
         student_mock.config.max_state_dim = canned_state.shape[-1]
-        student_mock.model.embed_prefix.return_value = (torch.zeros(1, 8, 256), torch.ones(1, 8, dtype=torch.bool), torch.ones(1, 8, dtype=torch.long))
+        student_mock.model.embed_prefix.return_value = (
+            torch.zeros(1, 8, 256),
+            torch.ones(1, 8, dtype=torch.bool),
+            torch.ones(1, 8, dtype=torch.long),
+        )
         student_mock.model._prepare_attention_masks_4d.return_value = torch.ones(1, 1, 8, 8)
         student_mock.model.paligemma_with_expert.forward.return_value = (None, [("fake_cache",)])
         student_mock.model.paligemma_with_expert.paligemma.model.language_model.config = MagicMock()
@@ -352,12 +351,15 @@ class TestBuildVelocityAdapters:
             return_value=torch.ones(1, 8, 8, dtype=torch.bool),
         ):
             _, student_fn = _build_velocity_adapters(teacher_mock, student_mock, "pi0")
-            v_with_tt = student_fn(torch.zeros(1, 3, 4), torch.rand(1),
-                                   target_time=torch.ones(1), **obs)
-            v_without_tt = student_fn(torch.zeros(1, 3, 4), torch.rand(1), **obs)
+            tt = torch.ones(1)
+            student_fn(torch.zeros(1, 3, 4), torch.rand(1), target_time=tt, **obs)
+            student_fn(torch.zeros(1, 3, 4), torch.rand(1), **obs)
 
-        # Both paths return the same thing — target_time is currently ignored.
-        assert torch.allclose(v_with_tt, v_without_tt)
+        # First call: target_time=tt. Second call: target_time=None (default).
+        calls = student_mock.model.denoise_step.call_args_list
+        assert len(calls) == 2
+        assert calls[0].kwargs["target_time"] is tt
+        assert calls[1].kwargs["target_time"] is None
 
 
 class TestSaveCheckpoint:
@@ -433,15 +435,17 @@ class TestSnapFlowBackendFit:
         )
         # load_teacher + _build_dataloader are LAZY-imported inside fit(),
         # so we patch them at their source modules (not at snapflow_backend).
+        # enable_snapflow has a real isinstance check that rejects MagicMock —
+        # patch it to no-op since this test doesn't exercise that path.
         with patch(
             "reflex.distill.teacher_loader.load_teacher",
             return_value=fake_loaded,
         ), patch(
+            "reflex.distill.snapflow_pi0_model.enable_snapflow",
+            return_value=None,
+        ), patch(
             "reflex.finetune.backends.snapflow_backend._build_velocity_adapters",
             return_value=(lambda *a, **kw: None, lambda *a, **kw: None),
-        ), patch(
-            "copy.deepcopy",
-            return_value=fake_policy,
         ), patch(
             "reflex.finetune.backends.snapflow_backend._build_dataloader",
             side_effect=ImportError("lerobot.datasets not available"),
