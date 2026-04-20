@@ -411,8 +411,9 @@ def run_ported_libero(
                                 print(f"[debug] batch_pp keys: {sorted(batch_pp.keys())}")
                             with torch.no_grad():
                                 if use_1nfe:
-                                    # SnapFlow 1-NFE path: single denoise_step
+                                    # SnapFlow 1-NFE: single denoise_step
                                     # at target_time=1 via the subclass override.
+                                    # pi0.5 signature differs from pi0 — no state.
                                     from lerobot.utils.constants import (
                                         OBS_LANGUAGE_ATTENTION_MASK,
                                         OBS_LANGUAGE_TOKENS,
@@ -420,10 +421,17 @@ def run_ported_libero(
                                     images, img_masks = policy._preprocess_images(batch_pp)
                                     lang_tokens = batch_pp[OBS_LANGUAGE_TOKENS]
                                     lang_masks = batch_pp[OBS_LANGUAGE_ATTENTION_MASK]
-                                    state_t = policy.prepare_state(batch_pp)
-                                    chunk = policy.model.sample_actions_1step(
-                                        images, img_masks, lang_tokens, lang_masks, state_t,
-                                    )
+                                    if hasattr(policy, "prepare_state"):
+                                        # pi0 path: needs state
+                                        state_t = policy.prepare_state(batch_pp)
+                                        chunk = policy.model.sample_actions_1step(
+                                            images, img_masks, lang_tokens, lang_masks, state_t,
+                                        )
+                                    else:
+                                        # pi0.5 path: no state
+                                        chunk = policy.model.sample_actions_1step(
+                                            images, img_masks, lang_tokens, lang_masks,
+                                        )
                                 else:
                                     chunk = policy.predict_action_chunk(batch_pp)
                             # Apply postprocessor (unnormalizes back to env

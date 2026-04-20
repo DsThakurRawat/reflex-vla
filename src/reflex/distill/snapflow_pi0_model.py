@@ -40,33 +40,45 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Cached subclass — built once per process at first enable_snapflow() call,
+# Cached subclasses — built once per process at first enable_snapflow() call,
 # which is when we can safely import lerobot.
-_SNAPFLOW_CLASS: Any = None
+_SNAPFLOW_PI0_CLASS: Any = None
+_SNAPFLOW_PI05_CLASS: Any = None
 
 
-def enable_snapflow(pi0_model: Any) -> None:
-    """Mutate a PI0Pytorch instance in place so it supports target_time.
+def enable_snapflow(model: Any) -> None:
+    """Mutate a pi-family Pytorch instance in place so it supports target_time.
+
+    Dispatches by class:
+      - PI0Pytorch  → SnapFlowPI0Pytorch  (state-aware embed_suffix)
+      - PI05Pytorch → SnapFlowPI05Pytorch (no state, AdaRMS time conditioning)
 
     See module docstring for the three behavioral changes this enables.
 
     Args:
-      pi0_model: an instance of ``lerobot.policies.pi0.modeling_pi0.PI0Pytorch``
-        (typically ``student_policy.model`` after PI0Policy.from_pretrained).
+      model: an instance of either ``PI0Pytorch`` or ``PI05Pytorch``
+        (typically ``policy.model`` after from_pretrained).
 
     Raises:
-      TypeError: if ``pi0_model`` isn't a PI0Pytorch instance.
+      TypeError: if ``model`` isn't one of the supported pi-family classes.
     """
     import torch
     import torch.nn as nn
     from lerobot.policies.pi0.modeling_pi0 import PI0Pytorch
+    from lerobot.policies.pi05.modeling_pi05 import PI05Pytorch
 
-    if not isinstance(pi0_model, PI0Pytorch):
+    if isinstance(model, PI0Pytorch):
+        snapflow_cls = _resolve_snapflow_pi0_class()
+        family = "pi0"
+    elif isinstance(model, PI05Pytorch):
+        snapflow_cls = _resolve_snapflow_pi05_class()
+        family = "pi05"
+    else:
         raise TypeError(
-            f"enable_snapflow expects PI0Pytorch; got {type(pi0_model).__name__}"
+            f"enable_snapflow expects PI0Pytorch or PI05Pytorch; got {type(model).__name__}"
         )
 
-    dim = pi0_model.action_in_proj.out_features
+    dim = model.action_in_proj.out_features
     hidden_dim = max(dim, 256)
 
     target_time_mlp = nn.Sequential(
@@ -78,26 +90,26 @@ def enable_snapflow(pi0_model: Any) -> None:
         target_time_mlp[-1].weight.zero_()
         target_time_mlp[-1].bias.zero_()
 
-    ref_param = next(pi0_model.parameters())
+    ref_param = next(model.parameters())
     target_time_mlp = target_time_mlp.to(
         dtype=ref_param.dtype, device=ref_param.device,
     )
 
-    pi0_model.add_module("target_time_embed_mlp", target_time_mlp)
-    pi0_model.__class__ = _resolve_snapflow_class()
+    model.add_module("target_time_embed_mlp", target_time_mlp)
+    model.__class__ = snapflow_cls
     logger.info(
-        "[snapflow] enabled target_time on PI0Pytorch (dim=%d, hidden=%d, init=zero)",
-        dim, hidden_dim,
+        "[snapflow] enabled target_time on %s (dim=%d, hidden=%d, init=zero)",
+        family, dim, hidden_dim,
     )
 
 
-def _resolve_snapflow_class() -> type:
+def _resolve_snapflow_pi0_class() -> type:
     """Build (or return cached) SnapFlowPI0Pytorch subclass of lerobot's
     PI0Pytorch. Lazy so importing this module doesn't force lerobot import.
     """
-    global _SNAPFLOW_CLASS
-    if _SNAPFLOW_CLASS is not None:
-        return _SNAPFLOW_CLASS
+    global _SNAPFLOW_PI0_CLASS
+    if _SNAPFLOW_PI0_CLASS is not None:
+        return _SNAPFLOW_PI0_CLASS
 
     import torch
     from lerobot.policies.pi0.modeling_pi0 import (
@@ -321,8 +333,218 @@ def _resolve_snapflow_class() -> type:
             # v_t from a well-distilled student approximates noise - action.
             return (x_t - v_t).to(noise.dtype)
 
-    _SNAPFLOW_CLASS = SnapFlowPI0Pytorch
+    _SNAPFLOW_PI0_CLASS = SnapFlowPI0Pytorch
     return SnapFlowPI0Pytorch
+
+
+def _resolve_snapflow_pi05_class() -> type:
+    """Build (or return cached) SnapFlowPI05Pytorch subclass of lerobot's
+    PI05Pytorch. Lazy so importing this module doesn't force lerobot import.
+
+    Architectural differences vs pi0:
+      - pi05 has NO state_proj. State is not in the suffix embedding.
+      - pi05 uses AdaRMSNorm for time conditioning: time_emb flows through
+        time_mlp_in → silu → time_mlp_out → silu, and the result becomes
+        adarms_cond passed to the gemma_expert via the AdaRMS layer.
+      - target_time injects ADDITIVELY to time_emb BEFORE the time_mlp
+        (so the zero-init MLP starts identity-equivalent to teacher).
+    """
+    global _SNAPFLOW_PI05_CLASS
+    if _SNAPFLOW_PI05_CLASS is not None:
+        return _SNAPFLOW_PI05_CLASS
+
+    import torch
+    from lerobot.policies.pi05.modeling_pi05 import (
+        PI05Pytorch,
+        create_sinusoidal_pos_embedding,
+        make_att_2d_masks,
+    )
+
+    class SnapFlowPI05Pytorch(PI05Pytorch):
+        """PI05Pytorch + target_time embed_suffix + deepcopy-free denoise_step.
+
+        Not constructed directly — produced by enable_snapflow() via
+        __class__-swap on a loaded PI05Pytorch instance.
+        """
+
+        def embed_suffix(
+            self,
+            noisy_actions,
+            timestep,
+            target_time=None,
+        ):
+            """Parent embed_suffix + optional zero-init target_time contribution.
+
+            target_time (when given) is sinusoidally encoded and routed
+            through ``target_time_embed_mlp`` (zero-init), then ADDED to
+            time_emb BEFORE the existing time_mlp_{in,out} chain. This way
+            the AdaRMS conditioning vector (adarms_cond) carries the
+            shortcut-velocity signal at target_time=1.
+            """
+            import torch.nn.functional as F
+
+            embs = []
+            pad_masks = []
+            att_masks = []
+
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep,
+                self.action_in_proj.out_features,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=timestep.device,
+            )
+            time_emb = time_emb.type(dtype=timestep.dtype)
+
+            if target_time is not None:
+                tt = target_time
+                if tt.ndim == 0:
+                    tt = tt.expand(time_emb.shape[0])
+                tt_emb = create_sinusoidal_pos_embedding(
+                    tt,
+                    self.action_in_proj.out_features,
+                    min_period=self.config.min_period,
+                    max_period=self.config.max_period,
+                    device=tt.device,
+                )
+                tt_emb = tt_emb.type(dtype=time_emb.dtype)
+                time_emb = time_emb + self.target_time_embed_mlp(tt_emb)
+
+            def action_proj_func(noisy_actions):
+                return self.action_in_proj(noisy_actions)
+
+            action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+
+            def time_mlp_func(time_emb):
+                x = self.time_mlp_in(time_emb)
+                x = F.silu(x)
+                x = self.time_mlp_out(x)
+                return F.silu(x)
+
+            time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+            action_time_emb = action_emb
+            adarms_cond = time_emb
+
+            embs.append(action_time_emb)
+            bsize, action_time_dim = action_time_emb.shape[:2]
+            action_time_mask = torch.ones(
+                bsize, action_time_dim, dtype=torch.bool, device=timestep.device,
+            )
+            pad_masks.append(action_time_mask)
+
+            att_masks += [1] + ([0] * (self.config.chunk_size - 1))
+
+            embs = torch.cat(embs, dim=1)
+            pad_masks = torch.cat(pad_masks, dim=1)
+            att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+            att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+
+            return embs, pad_masks, att_masks, adarms_cond
+
+        def denoise_step(
+            self,
+            prefix_pad_masks,
+            past_key_values,
+            x_t,
+            timestep,
+            target_time=None,
+            state=None,  # accepted for API compat with pi0 path; ignored
+        ):
+            """Parent denoise_step minus the deepcopy and minus the fp32 cast.
+
+            ``state`` kwarg is accepted for cross-family API compatibility
+            with the pi0 adapter's ``_run_denoise_step`` but is unused —
+            pi0.5 doesn't put state in the suffix embedding.
+            """
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+                x_t, timestep, target_time=target_time,
+            )
+
+            suffix_len = suffix_pad_masks.shape[1]
+            batch_size = prefix_pad_masks.shape[0]
+            prefix_len = prefix_pad_masks.shape[1]
+
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size, suffix_len, prefix_len,
+            )
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            full_att_2d_masks = torch.cat(
+                [prefix_pad_2d_masks, suffix_att_2d_masks], dim=2,
+            )
+
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+            full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+            self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+
+            suffix_out = outputs_embeds[1]
+            suffix_out = suffix_out[:, -self.config.chunk_size:]
+            suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+            return self.action_out_proj(suffix_out)
+
+        @torch.no_grad()
+        def sample_actions_1step(
+            self,
+            images,
+            img_masks,
+            tokens,
+            masks,
+            noise=None,
+        ):
+            """SnapFlow 1-NFE inference for pi0.5 (no state argument).
+
+            Mirror of PI05Pytorch.sample_actions but with num_steps=1 and
+            target_time=1 threaded into the single denoise_step call.
+            """
+            bsize = tokens.shape[0]
+            device = tokens.device
+
+            if noise is None:
+                actions_shape = (
+                    bsize, self.config.chunk_size, self.config.max_action_dim,
+                )
+                noise = self.sample_noise(actions_shape, device)
+
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, tokens, masks,
+            )
+            prefix_att_2d = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d)
+            self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+
+            time = torch.ones(bsize, dtype=torch.float32, device=device)
+            action_dtype = self.action_in_proj.weight.dtype
+            x_t = noise.to(action_dtype)
+            v_t = self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=time,
+                target_time=time,
+            )
+            return (x_t - v_t).to(noise.dtype)
+
+    _SNAPFLOW_PI05_CLASS = SnapFlowPI05Pytorch
+    return SnapFlowPI05Pytorch
 
 
 def load_snapflow_student(checkpoint_path: Any) -> Any:

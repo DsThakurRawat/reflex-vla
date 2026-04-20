@@ -318,13 +318,91 @@ def _build_velocity_adapters(
     Raises NotImplementedError for policy_types we haven't wired yet
     (SmolVLA v0.3.1; GR00T v0.5+).
     """
-    if policy_type in ("pi0", "pi05"):
-        return _build_pi_family_adapters(teacher, student)
+    if policy_type == "pi0":
+        return _build_pi0_adapters(teacher, student)
+    if policy_type == "pi05":
+        return _build_pi05_adapters(teacher, student)
     raise NotImplementedError(
         f"No velocity adapter for policy_type={policy_type!r}. "
         f"pi0/pi05 are supported in v0.3; SmolVLA in v0.3.1; "
         f"GR00T in v0.5+."
     )
+
+
+def _build_pi0_adapters(teacher: Any, student: Any):
+    """Delegating alias for the pi0-specific adapter builder."""
+    return _build_pi_family_adapters(teacher, student)
+
+
+def _build_pi05_adapters(teacher: Any, student: Any):
+    """Velocity adapters for pi0.5.
+
+    pi0.5 differs from pi0 in three ways that matter here:
+      1. ``embed_suffix`` signature is ``(noisy_actions, timestep)`` — no
+         state. State isn't projected into the suffix embedding at all
+         (pi0.5 relies on language + vision conditioning only).
+      2. ``denoise_step`` signature is ``(prefix_pad_masks, past_key_values,
+         x_t, timestep)`` — no state. SnapFlowPI05Pytorch override still
+         accepts ``state=None`` kwarg for cross-family compatibility but
+         it's unused.
+      3. PI05Policy has no ``prepare_state`` method; the VLM prefix is
+         computed from images + language only.
+
+    The velocity-function interface returned here matches the pi0 path
+    so the generic SnapFlow loss loop is paradigm-agnostic.
+    """
+    import torch
+    from lerobot.policies.pi05.modeling_pi05 import make_att_2d_masks
+
+    from lerobot.utils.constants import (
+        OBS_LANGUAGE_ATTENTION_MASK,
+        OBS_LANGUAGE_TOKENS,
+    )
+
+    def _build_prefix_cache_pi05(policy, obs_kwargs):
+        m = policy.model
+        images, img_masks = policy._preprocess_images(obs_kwargs)
+        lang_tokens = obs_kwargs[OBS_LANGUAGE_TOKENS]
+        lang_masks = obs_kwargs[OBS_LANGUAGE_ATTENTION_MASK]
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = m.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks,
+        )
+        prefix_att_2d = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_pos = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_4d = m._prepare_attention_masks_4d(prefix_att_2d)
+        m.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
+        m.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
+        _, past_kv = m.paligemma_with_expert.forward(
+            attention_mask=prefix_att_4d,
+            position_ids=prefix_pos,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return past_kv, prefix_pad_masks
+
+    def _run_denoise_step_pi05(policy, x, t, obs_kwargs, target_time=None):
+        action_dtype = policy.model.action_in_proj.weight.dtype
+        past_kv, prefix_pad_masks = _build_prefix_cache_pi05(policy, obs_kwargs)
+        if x.dtype != action_dtype:
+            x = x.to(action_dtype)
+        return policy.model.denoise_step(
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_kv,
+            x_t=x,
+            timestep=t,
+            target_time=target_time,
+        )
+
+    def teacher_velocity_fn(x, t, **obs_kwargs):
+        with torch.no_grad():
+            return _run_denoise_step_pi05(teacher, x, t, obs_kwargs, target_time=None)
+
+    def student_velocity_fn(x, t, target_time=None, **obs_kwargs):
+        return _run_denoise_step_pi05(student, x, t, obs_kwargs, target_time=target_time)
+
+    return teacher_velocity_fn, student_velocity_fn
 
 
 def _build_pi_family_adapters(
