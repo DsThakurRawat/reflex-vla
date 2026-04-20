@@ -387,6 +387,16 @@ def _build_pi_family_adapters(
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        # lerobot's denoise_step does `past_key_values = copy.deepcopy(past_kv)`
+        # internally (modeling_pi0.py:918). Deepcopy of autograd-attached
+        # tensors raises "Only Tensors created explicitly by the user
+        # support the deepcopy protocol" (pytorch#103001). Detach each
+        # layer's tensors so deepcopy succeeds.
+        # v0.3 consequence: VLM prefix doesn't receive student gradients —
+        # only the action expert + state/action projections train. The
+        # paper-exact SnapFlow trains all weights; we defer full-model
+        # gradient flow to v0.3.1 alongside the target_time surgery.
+        past_kv = _detach_kv_cache(past_kv)
         return past_kv, prefix_pad_masks, state
 
     def _run_denoise_step(policy, x, t, obs_kwargs):
@@ -490,6 +500,33 @@ def _infer_time_embedding_dim(model: Any) -> int:
 # ---------------------------------------------------------------------------
 # Dataloader + batch prep
 # ---------------------------------------------------------------------------
+
+def _detach_kv_cache(past_kv):
+    """Detach every tensor in a transformer KV cache so downstream
+    `copy.deepcopy(past_kv)` (as done by lerobot's denoise_step at line
+    918 of modeling_pi0.py) doesn't fail on graph-attached tensors.
+
+    past_kv format varies across transformers versions:
+      - list[tuple[Tensor, Tensor]] — classic tuple cache
+      - list[DynamicCache] — newer HF cache objects with .key_cache/.value_cache
+      - list[list[...]] — nested pi0 paligemma_with_expert shape
+
+    We walk it generically and detach whatever looks like a tensor.
+    """
+    import torch
+    def _walk(obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.detach()
+        if isinstance(obj, (list, tuple)):
+            mapped = [_walk(x) for x in obj]
+            return type(obj)(mapped) if not isinstance(obj, list) else mapped
+        # For HF DynamicCache-like objects, try to detach known slots.
+        for attr in ("key_cache", "value_cache"):
+            if hasattr(obj, attr):
+                setattr(obj, attr, _walk(getattr(obj, attr)))
+        return obj
+    return _walk(past_kv)
+
 
 def _build_preprocessor(
     *,
