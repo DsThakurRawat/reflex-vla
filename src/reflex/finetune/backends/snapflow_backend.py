@@ -119,7 +119,7 @@ class SnapFlowBackend:
             policy_type=policy_type,
         )
 
-        # ---- 3. Build dataloader ------------------------------------------
+        # ---- 3. Build dataloader + preprocessor ---------------------------
         try:
             loader = _build_dataloader(cfg, policy_type=policy_type)
         except Exception as e:
@@ -128,6 +128,19 @@ class SnapFlowBackend:
                 training_steps_completed=0,
                 status="training_failed",
                 error=f"dataloader construction failed: {type(e).__name__}: {e}",
+            )
+        try:
+            preprocessor = _build_preprocessor(
+                teacher_path=loaded.checkpoint_dir,
+                image_key_map=cfg.extra_lerobot_args.get("image_key_map"),
+                device=device,
+            )
+        except Exception as e:
+            return CheckpointResult(
+                final_checkpoint_path=Path(cfg.output),
+                training_steps_completed=0,
+                status="training_failed",
+                error=f"preprocessor construction failed: {type(e).__name__}: {e}",
             )
 
         # ---- 4. Optimizer + checkpoint dir --------------------------------
@@ -154,6 +167,9 @@ class SnapFlowBackend:
         log_handle = open(ctx.training_log_path, "a", encoding="utf-8")
         try:
             for step, batch in enumerate(loader, start=1):
+                # Apply lerobot's preprocessor pipeline: rename_map (image keys),
+                # tokenizer (task -> language_tokens), device transfer, normalize.
+                batch = preprocessor(batch)
                 action, noise, t, obs_kwargs = _prepare_batch(batch, device=device)
 
                 opt.zero_grad()
@@ -429,6 +445,42 @@ def _infer_time_embedding_dim(model: Any) -> int:
 # Dataloader + batch prep
 # ---------------------------------------------------------------------------
 
+def _build_preprocessor(
+    *,
+    teacher_path: Path,
+    image_key_map: dict | None,
+    device: str,
+):
+    """Load the teacher's preprocessor pipeline with optional rename overrides.
+
+    lerobot stores per-model preprocessor configs at
+    `policy_preprocessor.json` alongside the weights. The pipeline does:
+      1. rename_observations_processor  — maps dataset image keys to
+         what the model expects (empty for `lerobot/pi0_base`; users
+         must supply via image_key_map for real datasets)
+      2. to_batch_processor             — tensor-dict normalization
+      3. pi0_new_line_processor         — appends newline for language
+      4. tokenizer_processor            — task string -> language_tokens
+      5. device_processor               — moves to cuda
+      6. normalizer_processor           — state/action normalization
+
+    We override (1) with the caller's image_key_map and (5) with
+    the run's device. Other steps are left as-shipped.
+    """
+    from lerobot.processor.pipeline import DataProcessorPipeline
+
+    overrides: dict = {}
+    if image_key_map:
+        overrides["rename_observations_processor"] = {"rename_map": dict(image_key_map)}
+    overrides.setdefault("device_processor", {})["device"] = device
+
+    return DataProcessorPipeline.from_pretrained(
+        str(teacher_path),
+        config_filename="policy_preprocessor.json",
+        overrides=overrides,
+    )
+
+
 def _build_dataloader(cfg, *, policy_type: str):
     """Build a LeRobotDataset dataloader for the distillation run.
 
@@ -451,24 +503,23 @@ def _build_dataloader(cfg, *, policy_type: str):
 
 
 def _prepare_batch(batch: dict, *, device: str) -> tuple:
-    """Unpack a LeRobotDataset batch into (action, noise, t, obs_kwargs).
+    """Unpack a preprocessed LeRobotDataset batch into (action, noise, t, obs_kwargs).
 
-    LeRobotDataset batches have keys like 'action', 'observation.images.*',
-    'observation.state', 'language.task' — we split the action ground-truth
-    out and leave everything else in obs_kwargs for the velocity fn.
+    The batch has already been through the lerobot preprocessor pipeline,
+    so tensors are on-device and language is tokenized. We split the
+    action ground-truth out and leave everything else in obs_kwargs for
+    the velocity fn.
     """
     import torch
 
-    action = batch["action"].to(device)
+    action = batch["action"]
+    if action.device.type != device.split(":")[0]:
+        action = action.to(device)
     batch_size = action.shape[0]
     noise = torch.randn_like(action)
     t = torch.rand(batch_size, device=device)
 
-    obs_kwargs = {
-        k: v.to(device) if isinstance(v, torch.Tensor) else v
-        for k, v in batch.items()
-        if k != "action"
-    }
+    obs_kwargs = {k: v for k, v in batch.items() if k != "action"}
     return action, noise, t, obs_kwargs
 
 

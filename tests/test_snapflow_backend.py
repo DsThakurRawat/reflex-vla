@@ -31,6 +31,7 @@ from reflex.finetune.backends.base import CheckpointResult
 from reflex.finetune.backends.snapflow_backend import (
     DEFAULT_CONSISTENCY_ALPHA,
     SnapFlowBackend,
+    _build_preprocessor,
     _build_velocity_adapters,
     _infer_time_embedding_dim,
     _prepare_batch,
@@ -185,6 +186,54 @@ class TestInferTimeEmbeddingDim:
     def test_fallback_to_1024_when_unknown(self):
         model = object()  # no attrs
         assert _infer_time_embedding_dim(model) == 1024
+
+
+class TestBuildPreprocessor:
+    def test_overrides_rename_map_and_device(self, tmp_path):
+        """_build_preprocessor should inject the image_key_map into the
+        rename_observations_processor step and set device_processor's
+        device from the caller."""
+        captured = {}
+
+        class _Fake:
+            @classmethod
+            def from_pretrained(cls, path, config_filename, overrides):
+                captured["path"] = path
+                captured["config_filename"] = config_filename
+                captured["overrides"] = overrides
+                return "pipeline_stub"
+
+        with patch(
+            "lerobot.processor.pipeline.DataProcessorPipeline",
+            _Fake,
+        ):
+            result = _build_preprocessor(
+                teacher_path=tmp_path,
+                image_key_map={"obs.img.image": "obs.img.base_0_rgb"},
+                device="cuda",
+            )
+        assert result == "pipeline_stub"
+        assert captured["config_filename"] == "policy_preprocessor.json"
+        assert captured["overrides"]["rename_observations_processor"] == {
+            "rename_map": {"obs.img.image": "obs.img.base_0_rgb"},
+        }
+        assert captured["overrides"]["device_processor"]["device"] == "cuda"
+
+    def test_no_image_key_map_still_sets_device(self, tmp_path):
+        captured = {}
+
+        class _Fake:
+            @classmethod
+            def from_pretrained(cls, path, config_filename, overrides):
+                captured["overrides"] = overrides
+                return None
+
+        with patch(
+            "lerobot.processor.pipeline.DataProcessorPipeline", _Fake,
+        ):
+            _build_preprocessor(teacher_path=tmp_path, image_key_map=None, device="cpu")
+        assert "rename_observations_processor" not in captured["overrides"]
+        assert captured["overrides"]["device_processor"]["device"] == "cpu"
 
 
 class TestBuildVelocityAdapters:

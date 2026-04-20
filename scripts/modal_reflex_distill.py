@@ -118,6 +118,7 @@ def distill_modal(
     libero_gate_pp: float = 5.0,
     skip_libero_gate: bool = False,
     skip_export: bool = False,
+    image_key_map_json: str = "",
 ):
     """Run reflex.finetune.run_finetune(phase='distill') on Modal."""
     import logging
@@ -139,6 +140,9 @@ def distill_modal(
     }
     if skip_libero_gate:
         extra_args["libero_gate_skip"] = True
+    if image_key_map_json:
+        import json as _json
+        extra_args["image_key_map"] = _json.loads(image_key_map_json)
 
     cfg = FinetuneConfig(
         base="",
@@ -200,6 +204,7 @@ def main(
     libero_gate_pp: float = 5.0,
     skip_libero_gate: bool = False,
     skip_export: bool = False,
+    image_key_map_json: str = "",
 ):
     print(f"[reflex distill on Modal — SnapFlow]")
     print(f"  teacher: {teacher_export}")
@@ -224,6 +229,7 @@ def main(
         libero_gate_pp=libero_gate_pp,
         skip_libero_gate=skip_libero_gate,
         skip_export=skip_export,
+        image_key_map_json=image_key_map_json,
     )
     print("\n=== RESULT ===")
     for k, v in r.items():
