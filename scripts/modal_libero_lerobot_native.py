@@ -37,17 +37,21 @@ app = modal.App("reflex-libero-lerobot-native")
 
 
 def _hf_secret():
-    """HF token secret — only needed for gated models. Our current
-    model HuggingFaceVLA/smolvla_libero is public, so an empty secret
-    works fine and lets this script run on Modal workspaces without a
-    pre-registered 'huggingface' secret."""
+    """HF token secret. Needed for gated upstream dependencies (e.g.
+    pi0.5 pulls google/paligemma-3b-pt-224 at tokenizer init).
+
+    Dispatch (same pattern as modal_reflex_distill.py):
+      1. Local HF_TOKEN env var → wrap in ephemeral Secret.
+      2. Pre-registered Modal secret 'huggingface' → use as-is.
+      3. Empty dict fallback → works for fully-public models only.
+    """
     token = os.environ.get("HF_TOKEN", "")
     if token:
         return modal.Secret.from_dict({"HF_TOKEN": token})
-    # No local token → use empty secret. `HuggingFaceVLA/smolvla_libero`
-    # is public so this works. If gated access is needed later, set
-    # HF_TOKEN in env or create a 'huggingface' Modal secret.
-    return modal.Secret.from_dict({})
+    try:
+        return modal.Secret.from_name("huggingface")
+    except Exception:
+        return modal.Secret.from_dict({})
 
 
 def _repo_head_sha() -> str:
@@ -173,7 +177,6 @@ def run_ported_libero(
     # ─── Load policy (in-process, not via websocket) ─────────────────
     print(f"[ported] Loading {model_id}...")
     t0 = time.time()
-    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
     from lerobot.processor.pipeline import PolicyProcessorPipeline
     from lerobot.processor.converters import (
         batch_to_transition, transition_to_batch,
@@ -181,7 +184,23 @@ def run_ported_libero(
     )
     from huggingface_hub import snapshot_download
 
-    policy = SmolVLAPolicy.from_pretrained(model_id)
+    # Dispatch by model_id prefix. pi05 before pi0 (longer prefix first).
+    model_key = model_id.split("/")[-1].lower()
+    if model_key.startswith("pi05") or model_key.startswith("pi0.5") or "pi05" in model_key:
+        from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+        policy_cls = PI05Policy
+        detected_type = "pi05"
+    elif model_key.startswith("pi0") or "pi0" in model_key:
+        from lerobot.policies.pi0.modeling_pi0 import PI0Policy
+        policy_cls = PI0Policy
+        detected_type = "pi0"
+    else:
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+        policy_cls = SmolVLAPolicy
+        detected_type = "smolvla"
+    print(f"[ported] Detected policy type: {detected_type} ({policy_cls.__name__})")
+
+    policy = policy_cls.from_pretrained(model_id)
     policy.eval().to("cuda").to(torch.float32)
     repo_dir = snapshot_download(model_id)
     preprocessor = PolicyProcessorPipeline.from_pretrained(
@@ -439,26 +458,37 @@ def run_ported_libero(
 
 
 @app.local_entrypoint()
-def main(num_episodes: int = 1, tasks: str = "0", suite: str = "libero_10"):
+def main(
+    num_episodes: int = 1,
+    tasks: str = "0",
+    suite: str = "libero_10",
+    model_id: str = "HuggingFaceVLA/smolvla_libero",
+):
     """
-    --num-episodes N: episodes per task (OpenPI default: 50)
-    --tasks "0"       single task
-    --tasks "0,1,2"   multiple
-    --tasks "all"     all tasks in suite
-    --suite libero_10|libero_spatial|libero_object|libero_goal|libero_90
+    --num-episodes N    episodes per task (OpenPI default: 50)
+    --tasks "0"         single task
+    --tasks "0,1,2"     multiple
+    --tasks "all"       all tasks in suite
+    --suite             libero_10|libero_spatial|libero_object|libero_goal|libero_90
+    --model-id          HF repo id. Auto-dispatches policy class by name:
+                          lerobot/pi05_libero_finetuned → PI05Policy
+                          lerobot/pi0_base              → PI0Policy (vanilla)
+                          HuggingFaceVLA/smolvla_libero → SmolVLAPolicy
     """
     if tasks == "all":
         task_list = None  # run all
     else:
         task_list = [int(t) for t in tasks.split(",")]
-    print(f"Running OpenPI-port LIBERO {suite}: tasks={task_list or 'all'}, "
+    print(f"Running OpenPI-port LIBERO {suite}: model={model_id} tasks={task_list or 'all'}, "
           f"{num_episodes} eps each")
     r = run_ported_libero.remote(
+        model_id=model_id,
         num_episodes=num_episodes,
         task_suite_name=suite,
         task_indices=task_list,
     )
     print("\n=== RESULT ===")
+    print(f"  model: {r.get('model')}")
     print(f"  success_rate: {r.get('success_rate_pct', '?')}%")
     print(f"  total: {r['total_success']}/{r['total_eps']}")
     print(f"  errors: {len(r.get('errors', []))}")
