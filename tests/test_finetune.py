@@ -99,7 +99,7 @@ class TestLerobotCommandBuild:
         # upstream, this test catches it.
         joined = " ".join(cmd)
         assert "--policy.type=smolvla" in joined
-        assert "--policy.pretrained_model_path=lerobot/smolvla_base" in joined
+        assert "--policy.pretrained_path=lerobot/smolvla_base" in joined
         assert "--dataset.repo_id=lerobot/libero" in joined
         assert "--steps=5000" in joined
         assert "--batch_size=16" in joined

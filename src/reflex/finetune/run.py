@@ -118,7 +118,7 @@ def _build_lerobot_command(cfg: FinetuneConfig) -> list[str]:
     cmd = [
         "lerobot-train",
         f"--policy.type={policy_type}",
-        f"--policy.pretrained_model_path={cfg.base}",
+        f"--policy.pretrained_path={cfg.base}",
         f"--dataset.repo_id={cfg.dataset}",
         f"--output_dir={cfg.output}",
         f"--steps={cfg.num_steps}",
