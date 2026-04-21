@@ -202,12 +202,15 @@ def export_pi05_decomposed(
     del prefix_wrapper, ep_prefix
     gc.collect()
 
-    # pi05 prefix_seq_len = 3 vision views × 256 patches + 16 language
-    # tokens + small slack = 1024 (confirmed via earlier smoke runs at
-    # prefix_len=1018 for pi05_libero_finetuned_v044 dummy inputs). Use
-    # 1024 as a safe round number; the ONNX graph is shape-specialized
-    # at this fixed length regardless.
-    prefix_seq_len = 1024
+    # pi05 prefix_seq_len must match exactly what vlm_prefix.onnx will
+    # emit at runtime. With lang_tokens=(B,16) dummies above and 3 vision
+    # views × 256 patches each, the natural prefix seq_len is
+    # 3×256 + 16 = 784. Both ONNX graphs are shape-specialized to their
+    # export-time seq_len so they MUST match or attention will compute
+    # on zero-padded tail positions. (For production with longer lang
+    # prompts, both graphs would need dynamic seq_len via
+    # torch.export Dim — deferred until parity is green.)
+    prefix_seq_len = 3 * 256 + int(prefix_dummy["lang_tokens"].shape[1])
     past_kv_shape = (B, PI05_KV_HEADS, prefix_seq_len, PI05_HEAD_DIM)
     past_kv_dummies = [
         torch.randn(past_kv_shape, dtype=torch.float32)
