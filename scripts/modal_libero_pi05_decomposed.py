@@ -187,6 +187,7 @@ def run_decomposed_libero(
     num_steps_wait: int = 10,
     cache_ttl_sec: float = 0.2,
     cache_max_age_steps: int = 0,
+    action_cache_max_age_steps: int = 2,
     phash_hamming: int = 6,
     preprocessor_ref: str = "lerobot/pi05_libero_finetuned_v044",
     seed: int = 7,
@@ -261,16 +262,29 @@ def run_decomposed_libero(
 
     # ─── Load decomposed ONNX inference ──────────────────────────────
     from reflex.runtime.pi05_decomposed_server import Pi05DecomposedInference
+    # Map CLI cache_mode to class params:
+    #   none   → enable_cache=False
+    #   phash  → enable_cache=True, cache_level='prefix' (VLM-skip on hit)
+    #   action → enable_cache=True, cache_level='action' (full-forward skip on hit)
+    #            + cache_ignore_lang=True (pi0.5 state-in-lang needs this)
+    _enable_cache = cache_mode in ("phash", "action")
+    _cache_level = "action" if cache_mode == "action" else "prefix"
+    _ignore_lang = cache_mode == "action"
     inference = Pi05DecomposedInference(
         export_dir=decomposed_dir,
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        enable_cache=(cache_mode == "phash"),
+        enable_cache=_enable_cache,
         cache_ttl_sec=cache_ttl_sec,
         cache_max_age_steps=cache_max_age_steps,
         phash_hamming_threshold=phash_hamming,
+        cache_level=_cache_level,
+        action_cache_max_age_steps=action_cache_max_age_steps,
+        cache_ignore_lang=_ignore_lang,
     )
     print(f"[decomposed] Pi05DecomposedInference ready. cache_mode={cache_mode}, "
-          f"ttl={cache_ttl_sec}s, phash_threshold={phash_hamming}")
+          f"cache_level={_cache_level}, ignore_lang={_ignore_lang}, "
+          f"action_max_age_steps={action_cache_max_age_steps}, "
+          f"phash_threshold={phash_hamming}")
 
     # ─── LIBERO setup ────────────────────────────────────────────────
     np.random.seed(seed)
@@ -488,6 +502,7 @@ def main(
     suite: str = "libero_10",
     cache_ttl_sec: float = 0.2,
     cache_max_age_steps: int = 0,
+    action_cache_max_age_steps: int = 2,
     phash_hamming: int = 6,
     preprocessor_ref: str = "lerobot/pi05_libero_finetuned_v044",
     seed: int = 7,
@@ -498,7 +513,8 @@ def main(
                            through the decomposed ONNX).
     --decomposed-dir       Dir with vlm_prefix.onnx + expert_denoise.onnx
                            + reflex_config.json.
-    --cache                'none' (parity run) | 'phash' (enabled, obs hash)
+    --cache                'none' | 'phash' (VLM-skip cache) | 'action'
+                           (full-forward skip + cache_ignore_lang for pi0.5)
     --num-episodes         Episodes per task.
     --tasks "0" | "0,1" | "all"
     --suite                libero_10 (default) | others.
@@ -513,8 +529,8 @@ def main(
         task_list = None
     else:
         task_list = [int(t) for t in tasks.split(",")]
-    if cache not in {"none", "phash"}:
-        raise ValueError(f"--cache must be 'none' or 'phash', got {cache!r}")
+    if cache not in {"none", "phash", "action"}:
+        raise ValueError(f"--cache must be 'none'|'phash'|'action', got {cache!r}")
 
     print(f"Running decomposed LIBERO {suite}: cache={cache}, "
           f"tasks={task_list or 'all'}, {num_episodes} eps each")
@@ -527,6 +543,7 @@ def main(
         task_indices=task_list,
         cache_ttl_sec=cache_ttl_sec,
         cache_max_age_steps=cache_max_age_steps,
+        action_cache_max_age_steps=action_cache_max_age_steps,
         phash_hamming=phash_hamming,
         preprocessor_ref=preprocessor_ref,
         seed=seed,
