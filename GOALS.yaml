@@ -368,6 +368,12 @@ goals:
     check: "grep -q 'SmolVLAOnnxServer\\|monolithic.*task.*success' scripts/modal_libero_lerobot_native.py 2>/dev/null"
     weight: 9
 
+  - id: libero-via-monolithic-onnx-pi05-teacher
+    status: done
+    description: "Verify pi0.5 monolithic ONNX teacher (num_steps=10, `lerobot/pi05_libero_finetuned_v044`) on LIBERO matches the PyTorch teacher task-success. Measured 2026-04-21: ONNX 27/30 = 90.0% vs PyTorch 28/30 = 93.3%, -3.3 pp single-episode net difference. Three-episode disagreement (ONNX -2, +1 vs PyTorch); not systematic bias, stochastic drift over 10 denoise × 500+ env steps. Teacher ONNX is deployable but strictly worse than the FP16 distilled student (96.7%, 6.5 GB) across accuracy/size/speed. Side-effect: fixed monolithic export for LIBERO-finetuned configs — compile_model=True + gradient_checkpointing=True were colliding with torch.export's dynamo tracer ('Guard failed on same frame')."
+    check: "grep -q 'compile_model.*False\\|torch.compile = lambda' src/reflex/exporters/monolithic.py 2>/dev/null"
+    weight: 8
+
   - id: libero-n50-paper-standard-sample
     description: "OpenPI standard is 50 episodes × 10 tasks = 500 rollouts per evaluation. We ran N=25 (5 tasks × 5 eps). Expanding to N=50 (5 eps × 10 tasks) covers all libero_10 tasks. Useful for publishing a definitive number. ~2 hours Modal, ~$8 A10G. Only worth doing once libero-task34-gap-audit closes to community baseline."
     check: "grep -q '10/50\\|task_success.*N=50\\|full_suite' reflex_context/06_experiments/task_success_results.md 2>/dev/null"
