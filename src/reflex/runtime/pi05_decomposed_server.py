@@ -134,13 +134,30 @@ class Pi05DecomposedInference:
 
         prefix_path = self.export_dir / self.config["decomposed"]["vlm_prefix_onnx"]
         expert_path = self.export_dir / self.config["decomposed"]["expert_denoise_onnx"]
+        logger.info("ONNXRuntime available providers: %s", ort.get_available_providers())
+        logger.info("ONNXRuntime device: %s", ort.get_device())
+        logger.info("requested providers: %s", self._providers)
+
         logger.info("loading vlm_prefix: %s", prefix_path)
         self._sess_prefix = ort.InferenceSession(str(prefix_path), providers=self._providers)
         self._prefix_input_names = [i.name for i in self._sess_prefix.get_inputs()]
         self._prefix_output_names = [o.name for o in self._sess_prefix.get_outputs()]
+        actual_prefix = self._sess_prefix.get_providers()
+        logger.info("vlm_prefix actual providers: %s", actual_prefix)
+        if self._providers[0] == "CUDAExecutionProvider" and "CUDAExecutionProvider" not in actual_prefix:
+            logger.warning(
+                "CUDAExecutionProvider requested but NOT used for vlm_prefix — "
+                "falling back to: %s. Check that onnxruntime-gpu + cuDNN + cuBLAS + "
+                "cudart + curand + cufft + cusparse + cusolver + nvrtc libs are in "
+                "LD_LIBRARY_PATH. The image probably silently fell back to CPU.",
+                actual_prefix,
+            )
+
         logger.info("loading expert_denoise: %s", expert_path)
         self._sess_expert = ort.InferenceSession(str(expert_path), providers=self._providers)
         self._expert_input_names = [i.name for i in self._sess_expert.get_inputs()]
+        actual_expert = self._sess_expert.get_providers()
+        logger.info("expert_denoise actual providers: %s", actual_expert)
 
         self._cache: CacheEntry | None = None
         self._stats = CacheStats()
