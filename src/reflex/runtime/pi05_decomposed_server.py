@@ -324,7 +324,14 @@ class Pi05DecomposedInference:
 
     @staticmethod
     def _lang_hash(lang_tokens: np.ndarray) -> bytes:
-        return hashlib.md5(lang_tokens.tobytes()).digest()
+        # Use tolist() to normalize the numpy dtype + byte layout. The
+        # tensor path in the LIBERO harness (`lang_tokens.cpu().numpy()`)
+        # can produce arrays that have the same integer VALUES but
+        # different low-level byte patterns across calls (e.g., int64
+        # padding, uninitialized trailing bytes in the alignment) which
+        # breaks `tobytes()`-based hashing. Python int repr is
+        # canonical, so md5 over the list-repr is stable.
+        return hashlib.md5(repr(lang_tokens.tolist()).encode()).digest()
 
 
 __all__ = ["Pi05DecomposedInference", "CacheStats", "CacheEntry"]
