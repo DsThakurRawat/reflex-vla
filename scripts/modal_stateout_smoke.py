@@ -108,6 +108,15 @@ def smoke(
     # v0.3.1" starting point.
     policy = load_snapflow_student(student_checkpoint)
     policy.train().to("cuda").to(torch.bfloat16)
+    # Disable gradient checkpointing — otherwise use_cache=True silently
+    # flips to False, past_kv comes back empty, and the expert attention
+    # mask (built assuming prefix+suffix concatenation) doesn't match the
+    # attn_weights (suffix only). Distillation production paths disable
+    # this for the forward measurement too; we follow that pattern.
+    disable = getattr(policy.model, "gradient_checkpointing_disable", None)
+    if callable(disable):
+        disable()
+        log.info("  gradient_checkpointing disabled (so use_cache=True holds)")
     log.info("  loaded, dtype=bf16, device=cuda")
 
     # Re-enable with state-out variant. This requires resetting __class__
