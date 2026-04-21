@@ -145,6 +145,7 @@ def run_decomposed_libero(
     num_steps_wait: int = 10,
     cache_ttl_sec: float = 0.2,
     phash_hamming: int = 6,
+    preprocessor_ref: str = "lerobot/pi05_libero_finetuned_v044",
     seed: int = 7,
 ):
     """LIBERO rollout through the decomposed ONNX chain. Mirrors
@@ -186,15 +187,23 @@ def run_decomposed_libero(
     action_dim_pad = cfg.max_action_dim
     real_action_dim = cfg.output_features[ACTION].shape[0]
 
+    # Student-distillation checkpoints don't always ship the processor
+    # JSONs — fall back to the teacher HF repo (pi05_libero_finetuned_v044
+    # by default) which has the baseline preprocessor + normalizer stats.
+    from huggingface_hub import snapshot_download
+    proc_ref = preprocessor_ref or student_checkpoint
+    if proc_ref and not Path(proc_ref).exists():
+        proc_ref = snapshot_download(proc_ref)
+    print(f"[decomposed] Using processor configs from: {proc_ref}")
     preprocessor = PolicyProcessorPipeline.from_pretrained(
-        pretrained_model_name_or_path=student_checkpoint,
+        pretrained_model_name_or_path=proc_ref,
         config_filename="policy_preprocessor.json",
         to_transition=batch_to_transition,
         to_output=transition_to_batch,
         overrides={"device_processor": {"device": "cuda"}},
     )
     postprocessor = PolicyProcessorPipeline.from_pretrained(
-        pretrained_model_name_or_path=student_checkpoint,
+        pretrained_model_name_or_path=proc_ref,
         config_filename="policy_postprocessor.json",
         to_transition=policy_action_to_transition,
         to_output=transition_to_policy_action,
@@ -423,12 +432,13 @@ def main(
     suite: str = "libero_10",
     cache_ttl_sec: float = 0.2,
     phash_hamming: int = 6,
+    preprocessor_ref: str = "lerobot/pi05_libero_finetuned_v044",
     seed: int = 7,
 ):
     """
     --student-checkpoint   Path to SnapFlow student dir on volume (for
-                           preprocessor + policy.config only — inference
-                           actually runs through the decomposed ONNX).
+                           policy.config only — inference actually runs
+                           through the decomposed ONNX).
     --decomposed-dir       Dir with vlm_prefix.onnx + expert_denoise.onnx
                            + reflex_config.json.
     --cache                'none' (parity run) | 'phash' (enabled, obs hash)
@@ -437,6 +447,10 @@ def main(
     --suite                libero_10 (default) | others.
     --cache-ttl-sec        TTL after which cache entry is stale (default 0.2s).
     --phash-hamming        Per-image hamming distance threshold (default 6).
+    --preprocessor-ref     HF repo id OR local path for the preprocessor +
+                           postprocessor JSONs. Defaults to the teacher
+                           (pi05_libero_finetuned_v044) because student
+                           checkpoints don't ship processor configs.
     """
     if tasks == "all":
         task_list = None
@@ -456,6 +470,7 @@ def main(
         task_indices=task_list,
         cache_ttl_sec=cache_ttl_sec,
         phash_hamming=phash_hamming,
+        preprocessor_ref=preprocessor_ref,
         seed=seed,
     )
     print("\n=== RESULT ===")
