@@ -76,16 +76,28 @@ def export(
              "one-shot Euler. GR00T (DDPM) uses 4 as its runtime default. "
              "Only used when --monolithic is set.",
     ),
+    from_distilled: bool = typer.Option(
+        False,
+        "--from-distilled",
+        help="Treat MODEL as a reflex-saved SnapFlow student checkpoint dir "
+             "(contains model.safetensors with target_time_embed_mlp.* keys). "
+             "Auto-detects pi0 vs pi0.5 from config.json, exports at 1-NFE "
+             "with target_time=1 baked in. Output ONNX has the same I/O "
+             "signature as the matching teacher family's monolithic export, "
+             "so `reflex serve` loads it through the standard path.",
+    ),
 ):
     """Export a VLA model to ONNX + TensorRT for edge deployment."""
     _setup_logging(verbose)
     hardware = get_hardware_profile(target)
 
     if monolithic:
-        console.print(f"\n[bold]Reflex Export (monolithic, cos=1.0 verified path)[/bold]")
+        label = "SnapFlow student (1-NFE)" if from_distilled else "monolithic, cos=1.0 verified path"
+        console.print(f"\n[bold]Reflex Export ({label})[/bold]")
         console.print(f"  Model:      {model}")
         console.print(f"  Output:     {output}")
-        console.print(f"  num_steps:  {num_steps}")
+        if not from_distilled:
+            console.print(f"  num_steps:  {num_steps}")
         console.print()
 
         if dry_run:
@@ -94,7 +106,10 @@ def export(
             raise typer.Exit()
 
         try:
-            from reflex.exporters.monolithic import export_monolithic
+            if from_distilled:
+                from reflex.exporters.monolithic import export_snapflow_student_monolithic
+            else:
+                from reflex.exporters.monolithic import export_monolithic
         except ImportError as exc:
             console.print(f"[red]{exc}[/red]")
             console.print("\n[cyan]Fix: pip install 'reflex-vla[monolithic]' "
@@ -105,7 +120,10 @@ def export(
         import time
         start = time.perf_counter()
         try:
-            result = export_monolithic(model, output, num_steps=num_steps, target=target)
+            if from_distilled:
+                result = export_snapflow_student_monolithic(model, output, target=target)
+            else:
+                result = export_monolithic(model, output, num_steps=num_steps, target=target)
         except ImportError as exc:
             console.print(f"[red]Missing monolithic dep: {exc}[/red]")
             raise typer.Exit(2)

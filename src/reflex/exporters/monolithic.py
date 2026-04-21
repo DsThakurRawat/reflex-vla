@@ -855,6 +855,276 @@ def _apply_pi05_denoise_step_patch() -> None:
         pass
 
 
+def export_snapflow_student_monolithic(
+    checkpoint_path: str | Path,
+    output_dir: str | Path,
+    *,
+    target: str = "desktop",
+) -> dict[str, Any]:
+    """Export a SnapFlow-distilled student as monolithic ONNX at 1-NFE.
+
+    Takes a reflex-saved distill checkpoint dir (contains
+    ``model.safetensors`` with the base pi0/pi0.5 weights plus the
+    ``target_time_embed_mlp.*`` SnapFlow keys, config.json, processor
+    files), loads it via ``load_snapflow_student``, and produces a single
+    monolithic ONNX where the denoising loop is BAKED to one step with
+    ``target_time=1``.
+
+    The output ONNX has the same input/output signature as a regular
+    pi0/pi0.5 monolithic ONNX (per model family), so ``reflex serve``
+    can load it through the existing path without special-casing
+    distilled students. At runtime, one forward pass = one full action
+    chunk (no host-side Euler loop needed).
+
+    Parity claim: the ONNX replicates ``student.model.sample_actions_1step``
+    bit-exact up to the usual ONNX float32 precision floor. Student
+    task-success separately measured at 29/30 on LIBERO (vs teacher
+    28/30) — see the 2026-04-21 session log.
+    """
+    _require_monolithic_deps()
+
+    import torch
+    import torch.nn as nn
+    from onnx_diagnostic.torch_export_patches import torch_export_patches
+
+    from reflex.distill.snapflow_pi0_model import load_snapflow_student
+
+    apply_export_patches()
+
+    logger.info("[snapflow-export] Loading student from %s", checkpoint_path)
+    t0 = time.time()
+    policy = load_snapflow_student(checkpoint_path)
+    policy.eval().to("cpu").to(torch.float32)
+    _force_eager_attn(policy.model)
+    logger.info("[snapflow-export] Student loaded in %.1fs", time.time() - t0)
+
+    # Dispatch by model family (pi0 vs pi0.5). SnapFlowPI05Pytorch is a
+    # dynamic subclass of PI05Pytorch; isinstance catches it.
+    from lerobot.policies.pi0.modeling_pi0 import PI0Pytorch
+    from lerobot.policies.pi05.modeling_pi05 import PI05Pytorch
+
+    is_pi05 = isinstance(policy.model, PI05Pytorch)
+    is_pi0 = isinstance(policy.model, PI0Pytorch)
+
+    if not (is_pi05 or is_pi0):
+        raise TypeError(
+            f"SnapFlow export supports pi0 / pi0.5 students only; got "
+            f"{type(policy.model).__name__}"
+        )
+
+    # Monkey-patch the SnapFlow denoise_step to drop detach+deepcopy for
+    # export. During training we needed them for gradient isolation, but
+    # at export time we trace a single forward pass with no gradients;
+    # deepcopy of DynamicCache doesn't trace cleanly through torch.export.
+    # Replace with a minimal version that just passes past_kv through.
+    _install_snapflow_export_denoise_step(policy.model, is_pi05=is_pi05)
+
+    family = "pi05" if is_pi05 else "pi0"
+    logger.info("[snapflow-export] Family=%s, wrapping for export", family)
+
+    if is_pi05:
+        class SnapFlowStudentWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(
+                self,
+                img_base, img_wrist_l, img_wrist_r,
+                mask_base, mask_wrist_l, mask_wrist_r,
+                lang_tokens, lang_masks,
+                noise,
+            ):
+                return self.model.sample_actions_1step(
+                    [img_base, img_wrist_l, img_wrist_r],
+                    [mask_base, mask_wrist_l, mask_wrist_r],
+                    lang_tokens, lang_masks, noise=noise,
+                )
+    else:
+        class SnapFlowStudentWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(
+                self,
+                img_cam1, img_cam2, img_cam3,
+                mask_cam1, mask_cam2, mask_cam3,
+                lang_tokens, lang_masks,
+                state, noise,
+            ):
+                return self.model.sample_actions_1step(
+                    [img_cam1, img_cam2, img_cam3],
+                    [mask_cam1, mask_cam2, mask_cam3],
+                    lang_tokens, lang_masks, state, noise=noise,
+                )
+
+    wrapper = SnapFlowStudentWrapper(policy.model).eval()
+    cfg = policy.config
+    B = 1
+    chunk = cfg.chunk_size
+    action_dim = cfg.max_action_dim
+
+    if is_pi05:
+        dummy = dict(
+            img_base=torch.randn(B, 3, 224, 224, dtype=torch.float32),
+            img_wrist_l=torch.randn(B, 3, 224, 224, dtype=torch.float32),
+            img_wrist_r=torch.randn(B, 3, 224, 224, dtype=torch.float32),
+            mask_base=torch.ones(B, dtype=torch.bool),
+            mask_wrist_l=torch.ones(B, dtype=torch.bool),
+            mask_wrist_r=torch.ones(B, dtype=torch.bool),
+            lang_tokens=torch.randint(0, 257152, (B, 16), dtype=torch.long),
+            lang_masks=torch.ones(B, 16, dtype=torch.bool),
+            noise=torch.randn(B, chunk, action_dim, dtype=torch.float32),
+        )
+    else:
+        state_dim = getattr(cfg, "max_state_dim", 32)
+        dummy = dict(
+            img_cam1=torch.randn(B, 3, 224, 224, dtype=torch.float32),
+            img_cam2=torch.randn(B, 3, 224, 224, dtype=torch.float32),
+            img_cam3=torch.randn(B, 3, 224, 224, dtype=torch.float32),
+            mask_cam1=torch.ones(B, dtype=torch.bool),
+            mask_cam2=torch.ones(B, dtype=torch.bool),
+            mask_cam3=torch.ones(B, dtype=torch.bool),
+            lang_tokens=torch.randint(0, 257152, (B, 16), dtype=torch.long),
+            lang_masks=torch.ones(B, 16, dtype=torch.bool),
+            state=torch.randn(B, state_dim, dtype=torch.float32),
+            noise=torch.randn(B, chunk, action_dim, dtype=torch.float32),
+        )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    onnx_path = output_dir / "model.onnx"
+
+    logger.info("[snapflow-export] torch.export.export ...")
+    t0 = time.time()
+    with torch_export_patches(patch_transformers=True):
+        ep = torch.export.export(
+            wrapper, tuple(dummy.values()),
+            dynamic_shapes=None, strict=False,
+        )
+    logger.info("[snapflow-export] torch.export: %.1fs", time.time() - t0)
+
+    t0 = time.time()
+    torch.onnx.export(
+        ep, tuple(dummy.values()), str(onnx_path),
+        input_names=list(dummy.keys()), output_names=["actions"],
+        opset_version=19,
+    )
+    logger.info("[snapflow-export] ONNX conversion: %.1fs", time.time() - t0)
+
+    fixes = _fix_onnx_where_dtype_mismatches(onnx_path)
+    logger.info("[snapflow-export] post-export Cast fixes: %d", fixes)
+
+    _write_reflex_config(
+        output_dir, policy.config, num_steps=1,
+        model_id=str(checkpoint_path), model_type=f"{family}_snapflow",
+        target=target,
+    )
+
+    size_mb = onnx_path.stat().st_size / 1e6
+    data_files = list(output_dir.glob("*.data"))
+    total_mb = sum(f.stat().st_size for f in data_files) / 1e6 + size_mb
+    return {
+        "status": "ok",
+        "onnx_path": str(onnx_path),
+        "size_mb": total_mb,
+        "model_type": f"{family}_snapflow",
+        "num_steps": 1,
+        "target_time": 1.0,
+    }
+
+
+def _install_snapflow_export_denoise_step(model: Any, *, is_pi05: bool) -> None:
+    """Replace SnapFlowPI*Pytorch.denoise_step with an export-friendly variant
+    that drops the training-only detach+deepcopy (which doesn't trace
+    through torch.export.export). The 1-step export path calls denoise_step
+    exactly once per forward, so past_kv isn't reused across calls — the
+    defensive copy that matters for multi-step inference isn't needed here.
+    """
+    import torch
+    import torch.nn.functional as _F
+
+    if is_pi05:
+        from lerobot.policies.pi05.modeling_pi05 import make_att_2d_masks
+    else:
+        from lerobot.policies.pi0.modeling_pi0 import make_att_2d_masks
+
+    if is_pi05:
+        def _export_denoise_step(self, prefix_pad_masks, past_key_values, x_t,
+                                 timestep, target_time=None, state=None):
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+                x_t, timestep, target_time=target_time,
+            )
+            suffix_len = suffix_pad_masks.shape[1]
+            batch_size = prefix_pad_masks.shape[0]
+            prefix_len = prefix_pad_masks.shape[1]
+
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size, suffix_len, prefix_len,
+            )
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            prefix_allowed = _F.pad(prefix_pad_2d_masks, (0, suffix_len), value=True)
+            suffix_allowed = _F.pad(suffix_att_2d_masks, (prefix_len, 0), value=True)
+            full_att_2d_masks = prefix_allowed & suffix_allowed
+
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+            full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+            self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
+
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            suffix_out = outputs_embeds[1][:, -self.config.chunk_size:]
+            suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+            return self.action_out_proj(suffix_out)
+    else:
+        def _export_denoise_step(self, state, prefix_pad_masks, past_key_values,
+                                 x_t, timestep, target_time=None):
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+                state, x_t, timestep, target_time=target_time,
+            )
+            suffix_len = suffix_pad_masks.shape[1]
+            batch_size = prefix_pad_masks.shape[0]
+            prefix_len = prefix_pad_masks.shape[1]
+
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size, suffix_len, prefix_len,
+            )
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            prefix_allowed = _F.pad(prefix_pad_2d_masks, (0, suffix_len), value=True)
+            suffix_allowed = _F.pad(suffix_att_2d_masks, (prefix_len, 0), value=True)
+            full_att_2d_masks = prefix_allowed & suffix_allowed
+
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+            full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+            self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
+
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            suffix_out = outputs_embeds[1][:, -self.config.chunk_size:]
+            suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+            return self.action_out_proj(suffix_out)
+
+    # Bind onto the class (the SnapFlow subclass) so the instance picks
+    # it up. This overrides the training-time detach+deepcopy variant
+    # for the duration of the export process.
+    type(model).denoise_step = _export_denoise_step
+
+
 def export_gr00t_monolithic(
     model_id: str,
     output_dir: str | Path,
