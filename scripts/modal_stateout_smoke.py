@@ -209,7 +209,10 @@ def smoke(
              post_norm, pre_norm, abs(post_norm - pre_norm))
 
     # Verify training signal moved the state_proj weights
-    assert abs(post_norm - pre_norm) > 1e-4, (
+    # Threshold: bf16 + lr=1e-4 + 100 steps × init=0.02 grads gives
+    # ~1e-5 scale weight deltas. 1e-7 is the "anything moved at all"
+    # floor. Stage 2 (2k steps) should produce much larger deltas.
+    assert abs(post_norm - pre_norm) > 1e-7, (
         f"state_proj didn't receive gradients? pre={pre_norm:.6f} post={post_norm:.6f}"
     )
     # Verify loss is finite and moved
