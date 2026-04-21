@@ -554,8 +554,20 @@ def export_pi0_monolithic(
     logger.info("[pi0] Loading %s", model_id)
     from lerobot.policies.pi0.modeling_pi0 import PI0Policy
     t0 = time.time()
-    policy = PI0Policy.from_pretrained(model_id)
+    # Block torch.compile during from_pretrained — see pi05 branch for the
+    # "Guard failed on same frame" bug. pi0_base defaults to False so this
+    # is a no-op for canonical exports, but any fine-tuned pi0 config with
+    # compile_model=True (common pattern) would otherwise break the trace.
+    _orig_compile = torch.compile
+    torch.compile = lambda fn=None, *a, **kw: (fn if fn is not None else (lambda f: f))
+    try:
+        policy = PI0Policy.from_pretrained(model_id)
+    finally:
+        torch.compile = _orig_compile
     policy.eval().to("cpu").to(torch.float32)
+    _gc_disable = getattr(policy.model, "gradient_checkpointing_disable", None)
+    if callable(_gc_disable):
+        _gc_disable()
     _force_eager_attn(policy.model)
     logger.info("[pi0] Loaded in %.1fs", time.time() - t0)
 
@@ -707,8 +719,25 @@ def export_pi05_monolithic(
     logger.info("[pi05] Loading %s", model_id)
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy
     t0 = time.time()
-    policy = PI05Policy.from_pretrained(model_id)
+    # Block torch.compile during from_pretrained: LIBERO-finetuned configs
+    # (e.g. lerobot/pi05_libero_finetuned_v044) ship with compile_model=True,
+    # which wraps sample_actions + forward in torch.compile at __init__ time.
+    # torch.compile wrappers collide with torch.export's dynamo tracer and
+    # raise "Guard failed on same frame it was created" during export. Disable
+    # the compile step for the duration of the load.
+    _orig_compile = torch.compile
+    torch.compile = lambda fn=None, *a, **kw: (fn if fn is not None else (lambda f: f))
+    try:
+        policy = PI05Policy.from_pretrained(model_id)
+    finally:
+        torch.compile = _orig_compile
     policy.eval().to("cpu").to(torch.float32)
+    # Same gradient_checkpointing-on-by-default issue we hit in SnapFlow
+    # training on pi05 LIBERO teacher: leaves the gemma stack in a state
+    # where use_cache=True gets flipped, breaking past_kv construction.
+    _gc_disable = getattr(policy.model, "gradient_checkpointing_disable", None)
+    if callable(_gc_disable):
+        _gc_disable()
     _force_eager_attn(policy.model)
 
     # Apply the same PI05Pytorch-specific denoise_step patch (monolithic.py's
