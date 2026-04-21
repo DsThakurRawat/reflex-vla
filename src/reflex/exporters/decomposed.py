@@ -344,12 +344,16 @@ def _build_prefix_class():
             )
 
             # Flatten DynamicCache → tuple of tensors. Transformers 5.3
-            # DynamicCache exposes `.key_cache` and `.value_cache` as
-            # parallel lists indexed by layer.
+            # DynamicCache exposes `to_legacy_cache()` which returns a
+            # tuple of ``(key, value)`` pairs per layer. We use the
+            # legacy form because it's tensor-only (no Python object
+            # nesting) and traces cleanly through torch.export.
+            legacy = past_key_values.to_legacy_cache()
             flat: list = []
             for layer_idx in range(PI05_PALIGEMMA_LAYERS):
-                flat.append(past_key_values.key_cache[layer_idx])
-                flat.append(past_key_values.value_cache[layer_idx])
+                k, v = legacy[layer_idx]
+                flat.append(k)
+                flat.append(v)
             flat.append(prefix_pad_masks)
             return tuple(flat)
 
@@ -393,12 +397,17 @@ def _build_expert_class():
             prefix_pad_masks = args[PI05_PALIGEMMA_LAYERS * 2]
             noise = args[PI05_PALIGEMMA_LAYERS * 2 + 1]
 
-            # Reconstruct a minimal DynamicCache-compatible object. The
-            # paligemma_with_expert.forward only reads .key_cache /
-            # .value_cache and .get_seq_length() for our denoise path.
-            # A small shim suffices; torch.export traces through getattr
-            # and method calls on plain objects if they're pure tensor ops.
-            past_kv = _FlatCache(past_flat, PI05_PALIGEMMA_LAYERS)
+            # Reconstruct a proper DynamicCache via from_legacy_cache(),
+            # which accepts a tuple of (key, value) tensor pairs per
+            # layer. transformers 5.3's pi_gemma forward does
+            # isinstance(past_kv, DynamicCache) checks internally, so
+            # we must pass a real DynamicCache, not a shim.
+            from transformers.cache_utils import DynamicCache
+            legacy = tuple(
+                (past_flat[2 * i], past_flat[2 * i + 1])
+                for i in range(PI05_PALIGEMMA_LAYERS)
+            )
+            past_kv = DynamicCache.from_legacy_cache(legacy)
 
             action_dtype = self.model.action_in_proj.weight.dtype
             if noise.dtype != action_dtype:
