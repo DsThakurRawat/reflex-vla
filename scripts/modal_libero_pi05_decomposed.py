@@ -195,6 +195,7 @@ def run_decomposed_libero(
     forward path for ``Pi05DecomposedInference``.
     """
     import collections
+    import logging
     import math
     import time
     import traceback
@@ -202,6 +203,10 @@ def run_decomposed_libero(
 
     import numpy as np
     import torch
+
+    # The Pi05DecomposedInference module uses logger.info(...) for provider
+    # diagnostics; default root handler is WARN which swallows those.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     # PyTorch 2.6 default-weights_only-True refuses LIBERO init-state pickles.
     _orig_torch_load = torch.load
