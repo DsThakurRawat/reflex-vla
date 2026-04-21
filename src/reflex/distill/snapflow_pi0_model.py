@@ -635,11 +635,30 @@ def load_snapflow_student(checkpoint_path: Any) -> Any:
 
     path = Path(checkpoint_path)
     if not path.exists():
-        raise FileNotFoundError(
-            f"SnapFlow student checkpoint not found at {path}. Expected a "
-            f"reflex-saved pretrained_model/ dir with model.safetensors + "
-            f"config.json."
-        )
+        # Fallback: treat as HF repo id and snapshot_download. Lets callers
+        # point at, e.g., `lerobot/pi05_libero_finetuned_v044` for teacher-path
+        # ONNX eval where the base-model policy (no SnapFlow MLP) is
+        # acceptable — mlp_state will be empty, enable_snapflow attaches a
+        # zero-init MLP that contributes zero to the forward, and inference
+        # runs via the ORT session on the caller's ONNX anyway.
+        s = str(checkpoint_path)
+        looks_hf = "/" in s and not s.startswith(("./", "/", "~", ".."))
+        if looks_hf:
+            try:
+                from huggingface_hub import snapshot_download
+                logger.info("[load_snapflow_student] snapshot_download(%s)", s)
+                path = Path(snapshot_download(s))
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"SnapFlow student checkpoint not found at {path} and "
+                    f"HF snapshot_download for {s!r} failed: {e}"
+                )
+        else:
+            raise FileNotFoundError(
+                f"SnapFlow student checkpoint not found at {path}. Expected a "
+                f"reflex-saved pretrained_model/ dir with model.safetensors + "
+                f"config.json, or an HF repo id."
+            )
 
     sf_path = path / "model.safetensors"
     if not sf_path.exists():
