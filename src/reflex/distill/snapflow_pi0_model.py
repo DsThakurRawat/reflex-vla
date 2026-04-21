@@ -661,6 +661,19 @@ def load_snapflow_student(checkpoint_path: Any) -> Any:
             if f.is_file() and f.name != "model.safetensors":
                 shutil.copy(f, td_path / f.name)
         save_file(base_state, str(td_path / "model.safetensors"))
+        # Strip reflex-distill provenance keys from config.json — PI05Config
+        # (via draccus) is strict about unknown fields and rejects them at
+        # load time. The fields are written by _save_student_checkpoint as
+        # provenance metadata; not needed for inference.
+        import json
+        cfg_path = td_path / "config.json"
+        if cfg_path.exists():
+            with cfg_path.open() as f:
+                cfg_dict = json.load(f)
+            stripped = {k: v for k, v in cfg_dict.items() if not k.startswith("_reflex_")}
+            if stripped != cfg_dict:
+                with cfg_path.open("w") as f:
+                    json.dump(stripped, f, indent=2)
         policy = policy_cls.from_pretrained(str(td_path))
 
     enable_snapflow(policy.model)
