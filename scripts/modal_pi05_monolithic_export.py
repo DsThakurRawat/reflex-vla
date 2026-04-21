@@ -603,17 +603,23 @@ def parity_test_monolithic(model_id: str = "lerobot/pi05_base", num_steps: int =
 
 
 @app.local_entrypoint()
-def main(num_steps: int = 10, parity: bool = False):
+def main(
+    num_steps: int = 10,
+    parity: bool = False,
+    model_id: str = "lerobot/pi05_base",
+):
     """pi0.5 monolithic export + parity. Default num_steps=10 (canonical).
 
     Usage:
-        modal run scripts/modal_pi05_monolithic_export.py              # export
+        modal run scripts/modal_pi05_monolithic_export.py              # pi05_base export
         modal run scripts/modal_pi05_monolithic_export.py --parity     # ONNX parity
+        modal run scripts/modal_pi05_monolithic_export.py \\
+            --model-id lerobot/pi05_libero_finetuned_v044              # LIBERO-finetuned export
     """
     if parity:
-        result = parity_test_monolithic.remote(num_steps=num_steps)
+        result = parity_test_monolithic.remote(num_steps=num_steps, model_id=model_id)
     else:
-        result = export_pi0_monolithic_modal.remote(num_steps=num_steps)
+        result = export_pi0_monolithic_modal.remote(num_steps=num_steps, model_id=model_id)
     print("\n=== RESULT ===")
     for k, v in result.items():
         print(f"  {k}: {v}")
