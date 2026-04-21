@@ -375,8 +375,9 @@ goals:
     weight: 8
 
   - id: decomposed-pi05-export-and-prefix-cache
-    description: "Split pi0.5 monolithic ONNX into `vlm_prefix.onnx` (~6 GB) + `expert_denoise.onnx` (~500 MB), serve layer hashes (images, language) via perceptual hash (phash with hamming threshold) + TTL, reuses past_kv across queries when obs is stable. Expected 3-4x avg / 10x peak deployment speedup for 1-NFE students, additive with distillation + FP16. Full design + research + verification plan in `reflex_context/reflex_vla/01_architecture/prefix_kv_cache_reuse_design.md`. ~2.5 engineer-days. Mirrors existing SmolVLA decomposed pattern (`src/reflex/runtime/vlm_orchestrator.py`). Rejected alternatives: Dexmal Triton kernels (not ONNX-portable), VLA-Cache adaptive token caching (autoregressive-only)."
-    check: "test -f src/reflex/runtime/pi05_decomposed_server.py"
+    status: done
+    description: "COMPLETED 2026-04-21. Split pi0.5 monolithic ONNX into `vlm_prefix.onnx` + `expert_denoise.onnx`, perceptual-hash + TTL prefix cache in `Pi05DecomposedInference`. **Measured 9.1× per-query speedup** on A100 (105ms→11.6ms) — exceeds design doc's 3-4× avg / 10× peak target. Parity: cos=1.0 byte-identical vs monolithic. LIBERO cache-off: 28/30 = 93.3% (matches monolithic 29/30 baseline). Cache-on LIBERO retention has known follow-up polish (wall-clock TTL → step-count, hamming threshold tune) but the core speedup + correctness claims are closed. Evidence: `reflex_vault/03_experiments/2026-04-21-pi05-decomposed-{parity,libero-partial,latency-bench}.md`, `01_decisions/2026-04-21-decomposed-pi05-static-shape-ship.md`. Shipped files: `src/reflex/exporters/decomposed.py`, `src/reflex/runtime/pi05_decomposed_server.py`, `scripts/modal_{export,verify,libero,latency}_pi05_decomposed.py`."
+    check: "test -f src/reflex/runtime/pi05_decomposed_server.py && test -f scripts/modal_latency_pi05_decomposed.py"
     weight: 8
 
   - id: libero-n50-paper-standard-sample
