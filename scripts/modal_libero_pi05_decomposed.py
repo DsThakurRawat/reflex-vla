@@ -79,39 +79,52 @@ TASK_SUITE_MAX_STEPS = {
 }
 LIBERO_DUMMY_ACTION = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]
 
+# Image recipe duplicated from modal_libero_lerobot_native.py — that's
+# the proven one for pi0.5 LIBERO rollouts. osmesa render + pinned mujoco
+# + PYTHONPATH /opt/LIBERO all matter.
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install(
-        "git", "libgl1", "libglib2.0-0",
-        "libx11-dev", "libxrender1", "libxext6",
-        "libsm6", "libice6", "libxrandr2", "libxtst6", "libxi6",
-        "libxcomposite1", "libxdamage1", "libxfixes3", "libxcursor1",
-        "libxinerama1", "mesa-utils", "xvfb",
-        "libegl1", "libegl-mesa0", "libgles2", "libglvnd0", "libglx0",
-        "libgbm1", "libosmesa6",
-        "libsndfile1",
+        "git",
+        "libgl1-mesa-glx", "libglib2.0-0", "libegl1-mesa", "libglvnd0", "ffmpeg",
+        "cmake", "build-essential",
+        "libosmesa6", "libosmesa6-dev",
+        "clang",
     )
     .pip_install(
-        "lerobot==0.5.1",
-        "transformers==5.3.0",
-        "num2words",
+        "torch",
         "safetensors>=0.4.0",
+        "huggingface_hub",
+        "transformers<5.4,>=4.40",
+        "numpy",
+        "Pillow",
+        "pydantic>=2.0",
+        "pyyaml",
         "onnx>=1.16",
         "onnxruntime>=1.20",
         "onnxscript>=0.1",
-        "onnx-diagnostic>=0.9",
-        "optree",
-        "scipy",
-        "numpy",
-        "accelerate",
-        "draccus",
+        "mujoco==3.3.2",
+        "robosuite==1.4.1",
+        "h5py",
+        "bddl==1.0.1",
+        "future",
+        "robomimic",
+        "hydra-core>=1.1",
+        "easydict",
+        "einops",
         "opencv-python-headless",
-        "imageio[ffmpeg]",
+        "gym",
+        "gymnasium",
+        "lerobot==0.5.1",
+        "num2words",
+        "imageio",
     )
     .run_commands(
-        "pip install robosuite==1.4.1",
-        "pip install git+https://github.com/Lifelong-Robot-Learning/LIBERO.git",
+        "git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git /opt/LIBERO"
+        " && cd /opt/LIBERO && pip install . --no-deps"
     )
+    .add_local_file("scripts/patch_libero.py", "/root/patch_libero.py", copy=True)
+    .run_commands("python /root/patch_libero.py")
     .run_commands(
         f'echo "build_bust={_BUST}"',
         f'pip install "reflex-vla[monolithic] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla@{_HEAD}"',
@@ -120,9 +133,14 @@ image = (
     .env({
         "HF_HOME": HF_CACHE,
         "TRANSFORMERS_CACHE": f"{HF_CACHE}/transformers",
-        "MUJOCO_GL": "egl",
-        "PYOPENGL_PLATFORM": "egl",
+        "MUJOCO_GL": "osmesa",
+        "PYOPENGL_PLATFORM": "osmesa",
+        "LIBERO_DATA_DIR": "/tmp/libero_data",
+        "LIBERO_ASSET_DIR": "/opt/LIBERO/libero/libero/assets",
+        "LIBERO_BASE": "/tmp/libero_data",
+        "PYTHONPATH": "/opt/LIBERO",
     })
+    .run_commands("mkdir -p /tmp/libero_data")
 )
 
 
