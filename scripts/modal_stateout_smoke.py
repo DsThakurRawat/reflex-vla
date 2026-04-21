@@ -171,7 +171,9 @@ def smoke(
             use_cache=True,
         )
         # Denoise with state
-        time = torch.ones(B, dtype=torch.float32, device="cuda")
+        # Match model dtype (bf16) to avoid cascading cast failures
+        # inside embed_suffix's time_mlp_in / time_mlp_out linear layers.
+        time = torch.ones(B, dtype=torch.bfloat16, device="cuda")
         noise = torch.randn(*noise_shape, device="cuda", dtype=torch.bfloat16)
         v_t = policy.model.denoise_step(
             prefix_pad_masks=prefix_pad_masks,
