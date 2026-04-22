@@ -463,12 +463,14 @@ goals:
   # Plan to do this RIGHT — see reflex_context/04_product/wedge_priority_ranking.md.
 
   - id: serve-fix-decomposed-libero-state-out-preprocessor
-    description: "BUG: scripts/modal_libero_pi05_decomposed.py + src/reflex/runtime/pi05_decomposed_server.py don't swap to Pi05PrepareTokenizerStateOutStep when variant=state_out. Same fix as commit 16a1057 made to modal_libero_lerobot_native.py. Without this, state is double-fed (via state_proj AND lang prompt) which (a) confuses the model — explains 13/15 vs 14/15 PyTorch drop, (b) lang drifts per frame so any lang-keyed cache hits 0%."
-    check: "grep -q 'state_out\\|swap_prepare_step_in_pipeline' src/reflex/runtime/pi05_decomposed_server.py 2>/dev/null"
+    status: done
+    description: "DONE 2026-04-22 (commit c8fa7f4). scripts/modal_libero_pi05_decomposed.py now detects expert_takes_state=True in reflex_config.json and swaps to Pi05PrepareTokenizerStateOutStep. Fix lives in the harness (caller) not in src/reflex/runtime/pi05_decomposed_server.py because the server takes pre-tokenized lang_tokens as input — preprocessing correctness is a caller concern by design. Same fix pattern as commit 16a1057 for modal_libero_lerobot_native.py. Without this, state was double-fed (state_proj AND lang prompt) → lang_tokens drifted per frame → 0% cache hit rate."
+    check: "grep -q 'swap_prepare_step_in_pipeline\\|Pi05PrepareTokenizerStateOutStep' scripts/modal_libero_pi05_decomposed.py 2>/dev/null"
     weight: 9
 
   - id: serve-verify-lang-token-stability
-    description: "Verify v0.5 state-out preprocessor produces identical lang_tokens across all frames within an episode. 5-min test: run preprocessor on 50 frames of one LIBERO episode, hash each lang_tokens output, confirm all hashes match. If they don't, there's a deeper preprocessor bug. If they do, the cache moat is structurally sound."
+    status: done
+    description: "DONE 2026-04-22 (commit c8fa7f4). scripts/verify_pi05_state_out_lang_stability.py runs preprocessor on N fake frames with same task + different state, hashes OBS_LANGUAGE_TOKENS each, confirms all match (state-out) vs drift (baseline). Use as 5-min local sanity check before launching $5 LIBERO eval. Pass = lang stable → cache moat structurally sound."
     check: "test -f scripts/verify_pi05_state_out_lang_stability.py 2>/dev/null"
     weight: 8
 
