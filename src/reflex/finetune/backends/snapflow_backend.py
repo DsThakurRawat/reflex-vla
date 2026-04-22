@@ -276,6 +276,7 @@ class SnapFlowBackend:
         loss_history: list[dict[str, float]] = []
         log_handle = open(ctx.training_log_path, "a", encoding="utf-8")
         try:
+            import time as _time
             import torch as _torch
             target_dtype = _torch.bfloat16 if dtype == "bf16" else _torch.float32
             max_action_dim = getattr(teacher.config, "max_action_dim", None)
@@ -283,6 +284,11 @@ class SnapFlowBackend:
             variant = getattr(cfg, "variant", "default")
             loss_mode = getattr(cfg, "loss_mode", "snapflow")
             sensitivity_alpha = getattr(cfg, "state_sensitivity_alpha", 0.0)
+            heartbeat_every = int(
+                cfg.extra_lerobot_args.get("heartbeat_every", 50)
+            )
+            heartbeat_t0 = _time.time()
+            heartbeat_step0 = 0
             for step, batch in enumerate(loader, start=1):
                 # Apply lerobot's preprocessor pipeline: rename_map (image keys),
                 # tokenizer (task -> language_tokens), device transfer, normalize.
@@ -358,6 +364,20 @@ class SnapFlowBackend:
                     flow_matching=snap.flow_matching,
                     consistency=snap.consistency,
                 )
+
+                if step == 1 or step % heartbeat_every == 0:
+                    elapsed = _time.time() - heartbeat_t0
+                    steps_in_window = step - heartbeat_step0
+                    rate = steps_in_window / max(elapsed, 1e-6)
+                    eta_min = (cfg.num_steps - step) / max(rate, 1e-6) / 60.0
+                    logger.info(
+                        "[snapflow] step %d/%d  total=%.4f  fm=%.4f  cons=%.4f  "
+                        "rate=%.2f steps/s  eta=%.1f min",
+                        step, cfg.num_steps, snap.total, snap.flow_matching,
+                        snap.consistency, rate, eta_min,
+                    )
+                    heartbeat_t0 = _time.time()
+                    heartbeat_step0 = step
 
                 if step % checkpoint_every == 0 or step == cfg.num_steps:
                     last_ckpt = _save_student_checkpoint(

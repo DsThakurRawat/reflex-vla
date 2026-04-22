@@ -144,6 +144,8 @@ def distill_modal(
     loss_mode: str = "snapflow",
     warm_init_state_proj_from: str = "",
     state_sensitivity_alpha: float = 0.0,
+    checkpoint_every: int = 1000,
+    heartbeat_every: int = 50,
 ):
     """Run reflex.finetune.run_finetune(phase='distill') on Modal.
 
@@ -168,6 +170,8 @@ def distill_modal(
     extra_args = {
         "consistency_alpha": consistency_alpha,
         "libero_gate_threshold_pp": libero_gate_pp,
+        "checkpoint_every": checkpoint_every,
+        "heartbeat_every": heartbeat_every,
     }
     if skip_libero_gate:
         extra_args["libero_gate_skip"] = True
@@ -244,6 +248,8 @@ def main(
     loss_mode: str = "snapflow",
     warm_init_state_proj_from: str = "",
     state_sensitivity_alpha: float = 0.0,
+    checkpoint_every: int = 1000,
+    heartbeat_every: int = 50,
 ):
     print(f"[reflex distill on Modal — SnapFlow]")
     print(f"  teacher: {teacher_export}")
@@ -251,6 +257,7 @@ def main(
     print(f"  output:  /onnx_out/{output_subdir}")
     print(f"  steps:   {steps}  batch={batch_size}  lr={learning_rate}  "
           f"alpha={consistency_alpha}")
+    print(f"  checkpoint_every={checkpoint_every}  heartbeat_every={heartbeat_every}")
     if variant != "default":
         print(f"  variant: {variant}")
     if loss_mode != "snapflow":
@@ -281,6 +288,8 @@ def main(
         loss_mode=loss_mode,
         warm_init_state_proj_from=warm_init_state_proj_from,
         state_sensitivity_alpha=state_sensitivity_alpha,
+        checkpoint_every=checkpoint_every,
+        heartbeat_every=heartbeat_every,
     )
     print("\n=== RESULT ===")
     for k, v in r.items():
