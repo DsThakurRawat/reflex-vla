@@ -417,3 +417,35 @@ goals:
     description: "pip install reflex-vla && reflex serve <hf-id> works on a Jetson with no Docker, no Triton YAML, no NVIDIA Container Toolkit. The DX win that beats Triton even though Triton wins on raw features. Most customers will tolerate a 1.5x latency hit for a 60s install vs a 4-hour Triton-on-Jetson setup."
     check: "test -f docs/quickstart_jetson.md && grep -q 'pip install reflex-vla' README.md 2>/dev/null"
     weight: 7
+
+  # ── DEFERRED LONG-TERM SERVE (Phase 4-5; do NOT build now) ────────
+  # Strategic frame from 2026-04-22 wedge_priority_ranking.md: these
+  # patterns are valuable but only at fleet-scale (Phase 4 silicon era +
+  # Phase 5 datacenter). Building them now would dilute the "narrow +
+  # deep" Phase 1 positioning and slow shipping. By Phase 4 we'll have
+  # 50+ customers + VLA-specific knowledge → we'll write better versions
+  # than blind copies anyway.
+  #
+  # Listed here as low-weight permanent reminders so future-me doesn't
+  # re-litigate the decision. Do NOT mark these in_progress before
+  # Phase 4. Reference patterns live in /reference/{triton,ray,vllm}/.
+
+  - id: serve-multi-model-phase4
+    description: "Multi-model serving (Triton-class): host pi0 + SmolVLA + Octo + customer-finetuned variants on one server, route by model header. Massive cost saver for fleets. Reference: triton's model_repository pattern. DEFERRED to Phase 4 — single-model is enough until we have 50+ customers + multi-tenant pricing demands."
+    check: "true  # placeholder; gate is 'are we in Phase 4 yet?' not a code check"
+    weight: 1
+
+  - id: serve-distributed-actors-phase5
+    description: "Distributed actor model (Ray Serve-class): autoscaling replicas across a cluster, request routing, health checks. Required for hosted Reflex / inference-as-a-service. Reference: ray-project/ray serve subdir. DEFERRED to Phase 5 — only matters when we offer cloud-managed Reflex."
+    check: "true  # placeholder; gate is Phase 5 datacenter buildout"
+    weight: 1
+
+  # ── PERMANENT SKIP (do NOT build, ever) ──────────────────────────
+  # Documenting non-goals matters as much as goals when you're solo —
+  # without a record of "we considered this and said no", future-me
+  # might re-debate it.
+
+  - id: NOGOAL-vllm-token-scheduler
+    description: "vLLM-style token-level scheduler with paged attention. PERMANENT SKIP. Solves a problem flow-matching VLAs don't have: action chunks are fixed-size (50 actions, one forward pass) — there's no autoregressive token generation to schedule. Cost to copy = 5000+ lines of complex code. Value for VLA = literally zero. If a future contributor argues for adding this, point them here."
+    check: "true  # non-goal; always passes"
+    weight: 0
