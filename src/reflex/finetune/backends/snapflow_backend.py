@@ -216,6 +216,36 @@ class SnapFlowBackend:
                 error=f"preprocessor construction failed: {type(e).__name__}: {e}",
             )
 
+        # v0.5 state-out: build a second preprocessor for the student
+        # with the state-tokenization step swapped for the state-out
+        # variant (produces lang_tokens without state appended). Teacher
+        # keeps the original preprocessor so its forward stays correct.
+        student_preprocessor = preprocessor
+        if getattr(cfg, "variant", "default") == "state_out":
+            try:
+                student_preprocessor = _build_preprocessor(
+                    teacher_path=loaded.checkpoint_dir,
+                    image_key_map=cfg.extra_lerobot_args.get("image_key_map"),
+                    device=device,
+                )
+                from reflex.distill.pi05_state_out_processor import (
+                    swap_prepare_step_in_pipeline,
+                )
+                swap_prepare_step_in_pipeline(
+                    student_preprocessor,
+                    max_state_dim=getattr(teacher.config, "max_state_dim", 32),
+                )
+                logger.info(
+                    "[snapflow] built separate student preprocessor (state-out)"
+                )
+            except Exception as e:
+                return CheckpointResult(
+                    final_checkpoint_path=Path(cfg.output),
+                    training_steps_completed=0,
+                    status="training_failed",
+                    error=f"state-out preprocessor construction failed: {type(e).__name__}: {e}",
+                )
+
         # ---- 5. Optimizer + checkpoint dir --------------------------------
         opt = AdamW(
             (p for p in student.parameters() if p.requires_grad),
@@ -243,17 +273,39 @@ class SnapFlowBackend:
             target_dtype = _torch.bfloat16 if dtype == "bf16" else _torch.float32
             max_action_dim = getattr(teacher.config, "max_action_dim", None)
             chunk_size = getattr(teacher.config, "chunk_size", None)
+            variant = getattr(cfg, "variant", "default")
             for step, batch in enumerate(loader, start=1):
                 # Apply lerobot's preprocessor pipeline: rename_map (image keys),
                 # tokenizer (task -> language_tokens), device transfer, normalize.
-                batch = preprocessor(batch)
-                action, noise, t, obs_kwargs = _prepare_batch(
-                    batch,
-                    device=device,
-                    compute_dtype=target_dtype,
-                    max_action_dim=max_action_dim,
-                    chunk_size=chunk_size,
-                )
+                # v0.5 state-out: preprocess twice — teacher sees state-in-lang,
+                # student sees stripped-lang + state as an explicit batch key.
+                if variant == "state_out":
+                    teacher_batch = preprocessor(batch)
+                    student_batch = student_preprocessor(batch)
+                    action, noise, t, teacher_obs_kwargs = _prepare_batch(
+                        teacher_batch,
+                        device=device,
+                        compute_dtype=target_dtype,
+                        max_action_dim=max_action_dim,
+                        chunk_size=chunk_size,
+                    )
+                    _, _, _, obs_kwargs = _prepare_batch(
+                        student_batch,
+                        device=device,
+                        compute_dtype=target_dtype,
+                        max_action_dim=max_action_dim,
+                        chunk_size=chunk_size,
+                    )
+                else:
+                    batch = preprocessor(batch)
+                    action, noise, t, obs_kwargs = _prepare_batch(
+                        batch,
+                        device=device,
+                        compute_dtype=target_dtype,
+                        max_action_dim=max_action_dim,
+                        chunk_size=chunk_size,
+                    )
+                    teacher_obs_kwargs = None
 
                 opt.zero_grad()
                 loss, snap = snapflow_loss_step(
@@ -263,6 +315,7 @@ class SnapFlowBackend:
                     noise=noise,
                     t=t,
                     obs_kwargs=obs_kwargs,
+                    teacher_obs_kwargs=teacher_obs_kwargs,
                     consistency_alpha=consistency_alpha,
                 )
                 loss.backward()
@@ -417,17 +470,31 @@ def _build_pi05_adapters(teacher: Any, student: Any):
         )
         return past_kv, prefix_pad_masks
 
+    # v0.5 state-out detection: when the student's class is the
+    # state-out variant, its denoise_step requires state=<tensor>.
+    def _is_state_out(policy):
+        return type(policy.model).__name__ == "SnapFlowPI05StateOutPytorch"
+
     def _run_denoise_step_pi05(policy, x, t, obs_kwargs, target_time=None):
         action_dtype = policy.model.action_in_proj.weight.dtype
         past_kv, prefix_pad_masks = _build_prefix_cache_pi05(policy, obs_kwargs)
         if x.dtype != action_dtype:
             x = x.to(action_dtype)
+        extra = {}
+        if _is_state_out(policy):
+            # State-out student: denoise_step requires explicit state.
+            # The v0.5 preprocessor leaves OBS_STATE in the batch so it
+            # reaches obs_kwargs here.
+            from lerobot.utils.constants import OBS_STATE
+            state_vec = obs_kwargs[OBS_STATE]
+            extra["state"] = state_vec
         return policy.model.denoise_step(
             prefix_pad_masks=prefix_pad_masks,
             past_key_values=past_kv,
             x_t=x,
             timestep=t,
             target_time=target_time,
+            **extra,
         )
 
     def teacher_velocity_fn(x, t, **obs_kwargs):

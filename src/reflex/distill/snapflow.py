@@ -132,6 +132,7 @@ def snapflow_loss_step(
     noise: "torch.Tensor",
     t: "torch.Tensor",
     obs_kwargs: dict,
+    teacher_obs_kwargs: dict | None = None,
     consistency_alpha: float = DEFAULT_CONSISTENCY_ALPHA,
 ) -> tuple["torch.Tensor", SnapFlowLosses]:
     """Compute one SnapFlow training-step loss.
@@ -144,8 +145,15 @@ def snapflow_loss_step(
       action: ground-truth action chunk (B, chunk, action_dim).
       noise: Gaussian noise, same shape as action.
       t: random time per sample (B,), sampled Uniform(0, 1).
-      obs_kwargs: VLM conditioning inputs (image, state, language) that
-        both student and teacher forward passes need.
+      obs_kwargs: VLM conditioning inputs for the STUDENT (image, state,
+        language). For the default variant, used for both student and
+        teacher. For v0.5 'state_out' variant, this is the student-side
+        dict with stripped lang + explicit state; teacher gets its own
+        via ``teacher_obs_kwargs``.
+      teacher_obs_kwargs: optional separate conditioning for the teacher.
+        When None (default), teacher reuses ``obs_kwargs``. Set this when
+        student and teacher have different preprocessed forms (v0.5
+        state-out student).
       consistency_alpha: mix weight for the consistency term.
 
     Returns (loss_tensor, SnapFlowLosses snapshot). Caller does
@@ -153,6 +161,8 @@ def snapflow_loss_step(
     """
     import torch
     import torch.nn.functional as F
+
+    t_obs = teacher_obs_kwargs if teacher_obs_kwargs is not None else obs_kwargs
 
     # (a) Flow-matching term: student must match the analytic velocity
     # at the random interpolation point.
@@ -163,7 +173,7 @@ def snapflow_loss_step(
     # (b) Consistency term: student at target_time=1 should match the
     # teacher's 2-step Euler shortcut from x_t.
     v_shortcut = two_step_euler_shortcut(
-        teacher_velocity_fn, x_t, t, obs_kwargs=obs_kwargs,
+        teacher_velocity_fn, x_t, t, obs_kwargs=t_obs,
     )
     target_time_one = torch.ones_like(t)
     v_student_one = student_velocity_fn(
