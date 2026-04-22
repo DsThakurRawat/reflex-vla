@@ -19,7 +19,12 @@ clone_if_missing() {
     echo "  ✓ $name already cloned (skip)"
   else
     echo "  → cloning $name from $url"
-    git clone --depth 1 "$url" "$name"
+    # GIT_LFS_SKIP_SMUDGE=1 avoids failing when git-lfs isn't installed
+    # (some repos like Triton have LFS-tracked test fixtures we don't need
+    # for source reference).
+    # Don't fail the whole script if one clone breaks — just warn and continue.
+    GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 "$url" "$name" || \
+      echo "    ⚠ $name clone failed — continuing"
   fi
 }
 
