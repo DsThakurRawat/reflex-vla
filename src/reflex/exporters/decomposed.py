@@ -76,6 +76,7 @@ def export_pi05_decomposed(
     num_steps: int = 1,
     target: str = "desktop",
     student_checkpoint: str | Path | None = None,
+    variant: str = "default",
 ) -> dict[str, Any]:
     """Export pi0.5 as ``vlm_prefix.onnx`` + ``expert_denoise.onnx``.
 
@@ -126,6 +127,15 @@ def export_pi05_decomposed(
         from reflex.distill.snapflow_pi0_model import load_snapflow_student
         logger.info("[decomposed] Loading SnapFlow student from %s", student_checkpoint)
         policy = load_snapflow_student(student_checkpoint)
+        if variant == "state_out":
+            # The v0.5 student needs the state-out class swap + state_proj
+            # registered. load_snapflow_student installed default
+            # SnapFlowPI05Pytorch; reset class then upgrade.
+            from lerobot.policies.pi05.modeling_pi05 import PI05Pytorch
+            from reflex.distill.snapflow_pi0_model import enable_snapflow_state_out
+            policy.model.__class__ = PI05Pytorch
+            enable_snapflow_state_out(policy.model)
+            logger.info("[decomposed] enabled state-out variant on student")
     else:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
         logger.info("[decomposed] Loading %s", model_id)
@@ -228,6 +238,11 @@ def export_pi05_decomposed(
         expert_dummy[past_kv_names[idx]] = t
     expert_dummy["prefix_pad_masks"] = prefix_pad_masks_dummy
     expert_dummy["noise"] = torch.randn(B, chunk, action_dim, dtype=torch.float32)
+    if variant == "state_out":
+        # Add state input to the expert ONNX graph (matches the runtime
+        # signature of SnapFlowPI05StateOutPytorch.denoise_step).
+        state_dim = policy.model.state_proj.in_features
+        expert_dummy["state"] = torch.randn(B, state_dim, dtype=torch.float32)
 
     expert_path = output_dir / "expert_denoise.onnx"
     logger.info("[decomposed] Exporting expert (num_steps=%d) → %s", num_steps, expert_path)
@@ -269,6 +284,8 @@ def export_pi05_decomposed(
             "kv_heads": PI05_KV_HEADS,
             "head_dim": PI05_HEAD_DIM,
             "past_kv_tensor_names": past_kv_names,
+            "variant": variant,
+            "expert_takes_state": variant == "state_out",
         },
     }
     (output_dir / "reflex_config.json").write_text(json.dumps(reflex_cfg, indent=2))
@@ -399,6 +416,11 @@ def _build_expert_class():
     class _Pi05ExpertWrapper(nn.Module):
         """Runs the Euler denoise loop using a past_kv reconstructed
         from flat tensor inputs. ``num_steps`` is baked in at init.
+
+        v0.5 state-out: when ``pi05_model`` has a ``state_proj`` module
+        (i.e. it's a SnapFlowPI05StateOutPytorch), the wrapper expects
+        an additional ``state`` tensor at the END of args, and threads it
+        through denoise_step. Default variant keeps the original signature.
         """
 
         def __init__(self, pi05_model, num_steps):
@@ -408,13 +430,16 @@ def _build_expert_class():
             # SnapFlow student path: if the model has target_time_embed_mlp,
             # we pass target_time=1 to denoise_step. Otherwise plain teacher.
             self._is_snapflow = hasattr(pi05_model, "target_time_embed_mlp")
+            # v0.5 state-out path: model has explicit state_proj layer.
+            self._is_state_out = hasattr(pi05_model, "state_proj")
 
         def forward(self, *args):
-            # args layout: 36 past_kv tensors (k_0,v_0,k_1,v_1,...,
-            # k_17,v_17) + prefix_pad_masks + noise.
+            # args layout (default): 36 past_kv tensors + prefix_pad_masks + noise.
+            # args layout (state_out): same + state tensor (last position).
             past_flat = args[:PI05_PALIGEMMA_LAYERS * 2]
             prefix_pad_masks = args[PI05_PALIGEMMA_LAYERS * 2]
             noise = args[PI05_PALIGEMMA_LAYERS * 2 + 1]
+            state = args[PI05_PALIGEMMA_LAYERS * 2 + 2] if self._is_state_out else None
 
             # Reconstruct a proper DynamicCache by populating per-layer
             # via .update() — transformers 5.3 removed from_legacy_cache
@@ -445,6 +470,9 @@ def _build_expert_class():
                     (x_t.shape[0],), time_val,
                     dtype=torch.float32, device=x_t.device,
                 )
+                # State-out variant: pass state= to denoise_step. Default
+                # path leaves it unset.
+                state_kw = {"state": state} if self._is_state_out else {}
                 if self._is_snapflow:
                     target_time_tensor = torch.ones_like(time_tensor)
                     v_t = self.model.denoise_step(
@@ -453,6 +481,7 @@ def _build_expert_class():
                         x_t=x_t,
                         timestep=time_tensor,
                         target_time=target_time_tensor,
+                        **state_kw,
                     )
                 else:
                     v_t = self.model.denoise_step(
@@ -460,6 +489,7 @@ def _build_expert_class():
                         past_key_values=past_kv,
                         x_t=x_t,
                         timestep=time_tensor,
+                        **state_kw,
                     )
                 x_t = x_t + dt * v_t
 
