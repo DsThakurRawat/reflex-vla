@@ -560,3 +560,18 @@ goals:
     description: "Jetson Thor + JetPack 7.1 + FP4 quantization + GR00T N1.7 support. Thor ships in volume in 2026 and will be the primary bundle target. FP4 halves memory vs FP8 and 4x vs FP16 — required to fit larger VLAs on Thor's 64GB. JetPack 7.1 is the SDK. GR00T N1.7 is the next NVIDIA reference VLA. Table-stakes for Phase 2 bundles."
     check: "grep -q 'jetson_thor\\|fp4\\|jetpack_71' src/reflex/exporters/ 2>/dev/null"
     weight: 5
+
+  # ── PLAN V3 ADDITIONS (added 2026-04-22 after serve_technical_plan_v3) ──
+  # Two items surfaced during the serve v3 plan + its Appendix audit that
+  # weren't previously in GOALS.yaml. Both track real priorities so
+  # `monitors.yaml` detection signals align with goals.
+
+  - id: serve-record-replay
+    description: "`reflex serve --record <dir>` dumps every /act request+response to disk with latency / cache-hit / guard-violation metadata. `reflex replay <file>` replays locally against a chosen model/config and diffs behavior. Unique value: robotics bugs happen in physical environments and are brutal to reproduce; nobody has this for VLAs today. Also produces the A2C2 correction head's training data (deployment traces) so A2C2 (weight 10) has a data pipeline before it starts. JSONL format specified in reflex_context/04_product/serve_technical_plan_v3.md Appendix D.1. 3-5 days to implement; ships in Phase 0.5 DX."
+    check: "test -f src/reflex/runtime/record.py 2>/dev/null && grep -q 'def replay' src/reflex/cli.py 2>/dev/null"
+    weight: 8
+
+  - id: serve-cloud-latency-matrix
+    description: "Measure per-stage latency (VLM prefix / expert denoise / postprocess) across A10G + A100-80GB + H100 with p50/p95/p99 on pi0.5 decomposed + SmolVLA + pi0 FP16 + GR00T monolithic. Validates the projected-from-A10G scaling assumptions in serve_technical_plan_v3.md Appendix A BEFORE any Jetson measurements land. Writes per-hardware YAML to baselines/<hw>/<model>/<precision>.yaml per Appendix D.3 schema. 1-2 hr Modal + ~\\$5. Unblocks the `reflex bench` comparison feature and validates/invalidates the 'FA3 is 0% on ONNX serve path' claim flagged as `[unverified]` in Appendix A."
+    check: "test -f reflex_context/06_experiments/cloud_latency_matrix.md 2>/dev/null && grep -q 'p50\\|p95' reflex_context/06_experiments/cloud_latency_matrix.md 2>/dev/null"
+    weight: 6
