@@ -485,3 +485,43 @@ goals:
     description: "Measure VLM prefix forward time vs expert denoise forward time on the v0.5 student decomposed ONNX. Theoretical cache speedup = (vlm_time + expert_time) / expert_time. Target ≥3x (per design VLM is ~80%% of compute). Cheap (~\$1, 30 min Modal). Independent of cache-on/off LIBERO test — gives the upper-bound number for product positioning."
     check: "grep -q 'latency.*v050.*decomposed\\|microbench.*v0.5' reflex_context/03_experiments/ 2>/dev/null"
     weight: 7
+
+  # ── ADVANCED SERVE PERF (Phase B kernel-level wins, 2026-04-22) ──
+  # Layered on top of episode cache + RTC. Each is a 5-20%% latency win
+  # individually; together they compound. Sequence after cache moat is
+  # validated since these are pointless if the cache doesn't work.
+
+  - id: serve-cuda-graphs
+    description: "Capture the entire forward pass (VLM prefix + expert denoise) as one CUDA graph per-shape. Eliminates per-op kernel launch overhead. ~10-20%% latency win on Jetson where kernel launches are relatively expensive. Reference: vLLM's torch.cuda.graph + warmup pattern. Requires shape-stable inputs (we have static-shape decomposed exports — fits perfectly)."
+    check: "grep -q 'cuda.graph\\|capture_begin\\|cudagraph' src/reflex/runtime/*.py 2>/dev/null"
+    weight: 7
+
+  - id: serve-flash-attention-3
+    description: "Upgrade SDPA → Flash Attention 3 in the PaliGemma + expert. ~2x faster attention on H100 / Hopper-class. Drop-in replacement; mostly an import + monkey-patch. NB: only applies to the PyTorch path; ONNX export uses ONNXRuntime's attention kernel (already optimized but not FA3-level). Worth adding to PyTorch eval to close the lerobot KV cache deepcopy + sample_actions perf gap."
+    check: "grep -q 'flash_attn_3\\|FlashAttention3' src/reflex/ 2>/dev/null"
+    weight: 5
+
+  - id: serve-fp8-quantization-future
+    description: "FP8 quant of pi0/pi05/SmolVLA monolithic ONNX. Halves memory + 2x faster matmul on Hopper (H100) and future Jetson Thor. Currently we ship FP16. NB: needs hardware-specific QAT or PTQ calibration to avoid task success drop. DEFERRED until first H100 customer or Thor hardware lands. Track here so future-me has the goal."
+    check: "test -f src/reflex/exporters/fp8_quant.py 2>/dev/null"
+    weight: 4
+
+  - id: serve-adaptive-denoise-default
+    description: "Adaptive denoising / early-stop is gated as --experimental in src/reflex/kernels/turbo.py for smolvla/pi05/gr00t. Promote to default for pi0 (validated safe) + add per-model safety threshold. ~10-30%% latency win for 'easy' steps where flow-matching converges fast. Safety: gate on velocity threshold, never skip more than N steps total."
+    check: "grep -q 'adaptive.*default\\|EARLY_STOP_DEFAULT' src/reflex/kernels/turbo.py 2>/dev/null"
+    weight: 6
+
+  - id: serve-sub-frame-action-interpolation
+    description: "Robot wants 100Hz commands; model predicts at 20Hz (50ms per chunk). Interpolate between predicted action[i] and action[i+1] in the runtime so robot gets smooth motion. Lives in RTC adapter / action buffer. Existing lerobot ActionInterpolator class is the reference impl. Smoother motion = visually + functionally better robot behavior with zero model retraining."
+    check: "grep -q 'ActionInterpolator\\|sub_frame\\|interpolate_actions' src/reflex/runtime/*.py 2>/dev/null"
+    weight: 6
+
+  - id: serve-compile-cache
+    description: "torch.compile recompiles on every cold start (30-60s). Cache compiled artifacts to ~/.reflex/compile_cache/<model_hash>/ and reuse across server restarts. Requires hashing the model + dtype + device + input shapes. Also useful for distilled student variants — same architecture, different weights → cache hits. ~30-60s shaved from cold-start UX."
+    check: "test -f src/reflex/runtime/compile_cache.py 2>/dev/null"
+    weight: 5
+
+  - id: serve-sm-transport-jetson
+    description: "When client (robot driver) and server (Reflex) are on the SAME Jetson, skip HTTP and use shared-memory transport for image + state input + action output. Triton has /dev/shm pattern. ~5-15%% latency reduction by eliminating serialization + socket overhead. Only relevant for on-device deployment (the primary Reflex use case). DEFERRED to Phase 2-3 when hardware bundles ship."
+    check: "test -f src/reflex/runtime/shm_transport.py 2>/dev/null"
+    weight: 3
