@@ -108,6 +108,14 @@ tracing = [
     "opentelemetry-sdk>=1.30",
     "opentelemetry-exporter-otlp-proto-grpc>=1.30",
 ]
+# Real-Time Chunking adapter (B.3). Pulls in lerobot's RTC module so
+# `reflex serve --rtc` can wrap inference with the canonical RTCProcessor.
+# Lerobot is heavy (torch + vision + datasets); only install when serving
+# RTC-enabled deployments. Skeleton + config validation work without this
+# extra; only the actual processor construction needs it.
+rtc = [
+    "lerobot==0.5.1",
+]
 
 [project.scripts]
 reflex = "reflex.cli:app"

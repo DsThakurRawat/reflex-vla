@@ -861,6 +861,40 @@ def serve(
         help="Execute frequency in Hz — the rate at which the robot pops "
              "an action from the buffer. Only used when --replan-hz > 0.",
     ),
+    rtc: bool = typer.Option(
+        False,
+        "--rtc",
+        help="Enable Real-Time Chunking (RTC) — wraps inference with "
+             "lerobot's RTCProcessor so the robot keeps executing the tail "
+             "of one chunk while the next chunk is being computed. 2-3× "
+             "effective throughput on Jetson-class latency. Requires "
+             "`pip install reflex-vla[rtc]` (pulls lerobot==0.5.1).",
+    ),
+    rtc_execution_horizon: int = typer.Option(
+        10,
+        "--rtc-execution-horizon",
+        help="With --rtc: number of actions locked to the previous chunk "
+             "while the next is computed. Higher = more guidance, smoother "
+             "transitions; lower = more freedom for the new chunk. Default 10.",
+    ),
+    rtc_schedule: str = typer.Option(
+        "LINEAR",
+        "--rtc-schedule",
+        help="With --rtc: prefix attention schedule. ZEROS | ONES | LINEAR | EXP. "
+             "Default LINEAR (matches lerobot's RTCConfig default).",
+    ),
+    rtc_max_guidance_weight: float = typer.Option(
+        10.0,
+        "--rtc-max-guidance-weight",
+        help="With --rtc: max guidance weight clamp. Higher = stronger pull "
+             "toward previous chunk's prefix; lower = looser. Default 10.0.",
+    ),
+    rtc_debug: bool = typer.Option(
+        False,
+        "--rtc-debug",
+        help="With --rtc: enable lerobot's debug Tracker for per-step state "
+             "capture. Useful for replay forensics; small per-call overhead.",
+    ),
     record: str = typer.Option(
         "",
         help="If set, write every /act request+response to a JSONL trace in "
@@ -971,6 +1005,26 @@ def serve(
             )
             console.print(format_errors(warnings))
 
+    # Build RtcAdapterConfig if --rtc was passed (B.3 Day 1). Validates at
+    # the CLI layer — fail loud before runtime imports (same pattern as
+    # embodiment validation above).
+    rtc_cfg = None
+    if rtc:
+        from reflex.runtime.rtc_adapter import RtcAdapterConfig
+        try:
+            rtc_cfg = RtcAdapterConfig(
+                enabled=True,
+                replan_hz=replan_hz if replan_hz > 0 else 20.0,
+                execute_hz=execute_hz if execute_hz > 0 else 100.0,
+                rtc_execution_horizon=rtc_execution_horizon,
+                prefix_attention_schedule=rtc_schedule,
+                max_guidance_weight=rtc_max_guidance_weight,
+                debug=rtc_debug,
+            )
+        except ValueError as exc:
+            console.print(f"[red]Invalid RTC config: {exc}[/red]")
+            raise typer.Exit(1)
+
     # ROS2 mode short-circuits the HTTP path — hand off to the bridge.
     if ros2:
         try:
@@ -1047,6 +1101,10 @@ def serve(
             f"[cyan]record[/cyan]={record} ({record_images}"
             f"{', no-gzip' if record_no_gzip else ''})"
         )
+    if rtc:
+        composed.append(
+            f"[cyan]rtc[/cyan]=horizon{rtc_execution_horizon}/{rtc_schedule}"
+        )
     if composed:
         console.print(f"  Wedges:  {' · '.join(composed)}")
 
@@ -1100,6 +1158,7 @@ def serve(
         record_dir=record or None,
         record_image_redaction=record_images,
         record_gzip=not record_no_gzip,
+        rtc_config=rtc_cfg,
     )
     if api_key:
         composed.append("[cyan]api-key-auth[/cyan]")

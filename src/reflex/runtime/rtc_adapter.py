@@ -29,19 +29,30 @@ logger = logging.getLogger(__name__)
 # Soft import of lerobot.policies.rtc
 # ──────────────────────────────────────────────────────────────────
 try:
+    from lerobot.configs.types import RTCAttentionSchedule  # type: ignore
     from lerobot.policies.rtc import RTCProcessor  # type: ignore
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig  # type: ignore
     _RTC_AVAILABLE = True
 except ImportError:  # pragma: no cover
     RTCProcessor = None  # type: ignore
+    RTCConfig = None  # type: ignore
+    RTCAttentionSchedule = None  # type: ignore
     _RTC_AVAILABLE = False
+
+
+# Schedule names supported by lerobot's RTCAttentionSchedule enum. Hard-coded
+# (not derived from the import) so config validation works even when lerobot
+# isn't installed — fail with a clear error at construction time, not at
+# config-parse time.
+_VALID_SCHEDULES = ("ZEROS", "ONES", "LINEAR", "EXP")
 
 
 def require_rtc() -> None:
     """Raise if lerobot's RTC module isn't installed in this env."""
     if not _RTC_AVAILABLE:
         raise ImportError(
-            "lerobot.policies.rtc not available. Install lerobot>=0.5.1 "
-            "(pinned in reflex-vla exporters extras)."
+            "lerobot.policies.rtc not available. Install reflex-vla[rtc] "
+            "or pip install lerobot>=0.5.1."
         )
 
 
@@ -53,21 +64,62 @@ class RtcAdapterConfig:
     """Config knobs for RTC behavior. Populated from per-embodiment YAML
     (see features/serve/per-embodiment-configs.md) or CLI flags.
 
-    Open design questions (see design review doc):
-    - latency_percentile: p95 vs p99 — TBD per LeRobot maintainer
-    - prefix_weight_schedule: always trailing-zero or parameterizable — TBD
-    - guidance_space: 'normalized' (our default) vs 'processed' — TBD
+    Maps onto lerobot's `RTCConfig` (configuration_rtc.py) plus Reflex-side
+    extras for latency tracking and gripper handling. The mapping is built
+    in `_build_lerobot_rtc_config()`.
     """
 
     enabled: bool = False
     replan_hz: float = 20.0
     execute_hz: float = 100.0
     rtc_execution_horizon: int = 10  # actions locked to old chunk during replan
+    prefix_attention_schedule: str = "LINEAR"  # ZEROS | ONES | LINEAR | EXP
+    max_guidance_weight: float = 10.0
+    debug: bool = False
+    debug_maxlen: int = 100
     latency_percentile: int = 95      # p95 default; p99 if maintainer recommends
     cold_start_discard: int = 10      # first N chunks NOT recorded in latency tracker
     guidance_space: str = "normalized"  # 'normalized' | 'processed'
     gripper_dim_indices: list[int] = field(default_factory=list)
     skip_gripper_smoothing: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate the Reflex-side extras. lerobot's RTCConfig validates
+        its own fields when constructed via _build_lerobot_rtc_config()."""
+        if self.prefix_attention_schedule not in _VALID_SCHEDULES:
+            raise ValueError(
+                f"prefix_attention_schedule must be one of {_VALID_SCHEDULES}, "
+                f"got {self.prefix_attention_schedule!r}"
+            )
+        if self.max_guidance_weight <= 0:
+            raise ValueError(
+                f"max_guidance_weight must be positive, got {self.max_guidance_weight}"
+            )
+        if self.rtc_execution_horizon < 1:
+            raise ValueError(
+                f"rtc_execution_horizon must be >= 1, got {self.rtc_execution_horizon}"
+            )
+        if not 1 <= self.latency_percentile <= 99:
+            raise ValueError(
+                f"latency_percentile must be in [1, 99], got {self.latency_percentile}"
+            )
+
+
+def _build_lerobot_rtc_config(cfg: RtcAdapterConfig) -> Any:
+    """Build a lerobot RTCConfig from the Reflex-side RtcAdapterConfig.
+
+    Called only when cfg.enabled is True (require_rtc() guards the import).
+    Raises if lerobot isn't installed.
+    """
+    require_rtc()
+    return RTCConfig(
+        enabled=True,
+        prefix_attention_schedule=RTCAttentionSchedule(cfg.prefix_attention_schedule),
+        max_guidance_weight=cfg.max_guidance_weight,
+        execution_horizon=cfg.rtc_execution_horizon,
+        debug=cfg.debug,
+        debug_maxlen=cfg.debug_maxlen,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -178,18 +230,23 @@ class RtcAdapter:
             discard_first=config.cold_start_discard,
         )
         # Lerobot RTCProcessor — only constructed when enabled + dep available.
-        # TODO(rtc): finalize constructor args after Part A.2 of design review.
+        # Verified against lerobot 0.5.1 source: RTCProcessor(rtc_config: RTCConfig).
         self._processor: Any = None
         if config.enabled:
-            # TODO(rtc): real construction — signature pending maintainer confirmation
-            # self._processor = RTCProcessor(
-            #     execution_horizon=config.rtc_execution_horizon,
-            #     prefix_weight_schedule=...,
-            # )
-            pass
+            lerobot_cfg = _build_lerobot_rtc_config(config)
+            self._processor = RTCProcessor(lerobot_cfg)
+            logger.info(
+                "RTCProcessor initialized — execution_horizon=%d schedule=%s "
+                "max_guidance_weight=%.1f debug=%s",
+                config.rtc_execution_horizon,
+                config.prefix_attention_schedule,
+                config.max_guidance_weight,
+                config.debug,
+            )
 
         self._active_episode_id: str | None = None
         self._chunk_count: int = 0
+        self._prev_chunk_left_over: Any = None  # set in merge_and_update (Day 3)
 
     # ---- Public API ---------------------------------------------
 
@@ -233,7 +290,14 @@ class RtcAdapter:
         """
         self._active_episode_id = episode_id
         self._chunk_count = 0
-        # TODO(rtc): call self._processor.reset() when processor is wired
+        self._prev_chunk_left_over = None
+        # Clear the latency window — old samples are stale on a fresh episode
+        self.latency = LatencyTracker(
+            percentile=self.config.latency_percentile,
+            discard_first=self.config.cold_start_discard,
+        )
+        if self._processor is not None:
+            self._processor.reset_tracker()
         logger.info("[rtc] reset — new episode_id=%s", episode_id)
 
     # ---- Introspection ------------------------------------------
@@ -256,4 +320,6 @@ __all__ = [
     "LatencyTracker",
     "RtcCompatiblePolicy",
     "require_rtc",
+    "_VALID_SCHEDULES",
+    "_build_lerobot_rtc_config",
 ]

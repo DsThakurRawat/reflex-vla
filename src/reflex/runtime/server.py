@@ -1013,6 +1013,7 @@ def create_app(
     record_dir: str | Path | None = None,
     record_image_redaction: str = "hash_only",
     record_gzip: bool = True,
+    rtc_config: Any = None,
 ) -> Any:
     """Create a FastAPI app for serving VLA predictions.
 
@@ -1112,6 +1113,32 @@ def create_app(
     # (RTC adapter, action denormalization, reflex doctor) read via
     # getattr(server, 'embodiment_config', None).
     server.embodiment_config = embodiment_config
+
+    # Attach RTC adapter (B.3) if --rtc was passed. Day-1 scope: construct
+    # the processor + latency tracker; body methods land Day 2-3 of the B.3
+    # sprint. Stored on server.rtc_adapter for the /act handler to dispatch
+    # to once Day 4 wires the replan loop. Skeleton-safe: when rtc_config
+    # is None or rtc_config.enabled is False, this is a no-op.
+    server.rtc_adapter = None  # type: ignore[attr-defined]
+    if rtc_config is not None and getattr(rtc_config, "enabled", False):
+        try:
+            from .rtc_adapter import RtcAdapter
+            # action_buffer comes from server.configure_replan() in lifespan
+            # but RtcAdapter doesn't actually use it for Day 1 (construction
+            # only). Pass a stub for now; Day 4 wiring resolves this.
+            server.rtc_adapter = RtcAdapter(  # type: ignore[attr-defined]
+                policy=server,
+                action_buffer=getattr(server, "_action_buffer", None),
+                config=rtc_config,
+            )
+            logger.info(
+                "RTC adapter armed — execution_horizon=%d schedule=%s",
+                rtc_config.rtc_execution_horizon,
+                rtc_config.prefix_attention_schedule,
+            )
+        except Exception as e:  # noqa: BLE001 — RTC must never crash serve startup
+            logger.error("RTC adapter init failed (RTC disabled): %s", e)
+            server.rtc_adapter = None  # type: ignore[attr-defined]
 
     # Attach JSONL recorder (B.2) if --record was passed. Lazily emits the
     # header on the first /act call. Coexists with OTel tracing — see
