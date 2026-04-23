@@ -625,8 +625,9 @@ goals:
   # `monitors.yaml` detection signals align with goals.
 
   - id: serve-record-replay
-    description: "`reflex serve --record <dir>` dumps every /act request+response to disk with latency / cache-hit / guard-violation metadata. `reflex replay <file>` replays locally against a chosen model/config and diffs behavior. Unique value: robotics bugs happen in physical environments and are brutal to reproduce; nobody has this for VLAs today. LOAD-BEARING for 4 downstream goals: (1) A2C2 correction head training data (weight 10), (2) serve-auto-calibration (weight 8), (3) serve-self-distilling (weight 8), (4) serve-interpretability-replay (weight 7). Without this, those 4 goals block. JSONL format specified in reflex_context/04_product/serve_technical_plan_v3.md Appendix D.1. 3-5 days to implement; ships in Phase 0.5 DX."
+    description: "`reflex serve --record <dir>` dumps every /act request+response to disk with latency / cache-hit / guard-violation metadata. `reflex replay <file>` replays locally against a chosen model/config and diffs behavior. Unique value: robotics bugs happen in physical environments and are brutal to reproduce; nobody has this for VLAs today. LOAD-BEARING for 4 downstream goals: (1) A2C2 correction head training data (weight 10), (2) serve-auto-calibration (weight 8), (3) serve-self-distilling (weight 8), (4) serve-interpretability-replay (weight 7). SHIPPED 2026-04-24 across 4 atomic commits (6143028 + 1b89b50 + 3ef2d87 + d083065; +2120 lines, 80 pytest tests passing in 2.14s). Integration round-trip test + --image-dir deferred to consumer PRs. JSONL format specified in reflex_context/04_product/serve_technical_plan_v3.md Appendix D.1."
     check: "test -f src/reflex/runtime/record.py 2>/dev/null && grep -q 'def replay' src/reflex/cli.py 2>/dev/null"
+    status: done
     weight: 9
 
   - id: serve-cloud-latency-matrix
