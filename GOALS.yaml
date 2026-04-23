@@ -604,8 +604,9 @@ goals:
   # (GOALS.yaml) tracks them and monitors.yaml detection signals align.
 
   - id: serve-per-embodiment-configs
-    description: "JSON/YAML schema + 3 presets (Franka / SO-100 / UR5). Encodes action_space (type, dim, ranges), normalization (mean/std), gripper (idx, thresholds, inverted), cameras (resolution+fps+color_space), control (frequency_hz, chunk_size, rtc_execution_horizon), constraints (max_ee_velocity, max_gripper_velocity). PHASE 0.5 FOUNDATION — unblocks RTC adapter, A2C2, action denormalization, reflex doctor, auto-calibration. 2-4 days. Plan ref: serve_technical_plan_v3.md §4.5 + features/serve/per-embodiment-configs.md."
+    description: "JSON/YAML schema + 3 presets (Franka / SO-100 / UR5). Encodes action_space (type, dim, ranges), normalization (mean/std), gripper (idx, thresholds, inverted), cameras (resolution+fps+color_space), control (frequency_hz, chunk_size, rtc_execution_horizon), constraints (max_ee_velocity, max_gripper_velocity). PHASE 0.5 FOUNDATION — unblocks RTC adapter, A2C2, action denormalization, reflex doctor, auto-calibration. SHIPPED 2026-04-24 (commits 950d070 + 5ae667a + 954d162; 1548 lines, 40 tests passing). Downstream wiring per consumer PR. Plan ref: serve_technical_plan_v3.md §4.5 + features/serve/per-embodiment-configs.md."
     check: "test -f configs/embodiments/franka.json 2>/dev/null && test -f configs/embodiments/so100.json 2>/dev/null && test -f configs/embodiments/ur5.json 2>/dev/null"
+    status: done
     weight: 7
 
   - id: serve-action-denormalization-safety-net
