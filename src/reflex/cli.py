@@ -932,6 +932,17 @@ def serve(
              "if both are set. Use this for robots not covered by the shipped "
              "presets.",
     ),
+    inject_latency_ms: float = typer.Option(
+        0.0,
+        "--inject-latency-ms",
+        help="Synthetic deployment-latency injection (B.4 A2C2 transfer-validation "
+             "gate). Adds asyncio.sleep AFTER inference + JSONL recording so "
+             "recorded latency_ms is true compute cost while client observes "
+             "inference + injected delay. Range [0, 1000]. 0 = off (default). "
+             "Used to simulate Jetson-class deployment latency on Modal A10G "
+             "for the A2C2 transfer gate; see arxiv 2509.23224 §4 for "
+             "matching paper methodology.",
+    ),
     ros2: bool = typer.Option(
         False,
         "--ros2",
@@ -1159,6 +1170,7 @@ def serve(
         record_image_redaction=record_images,
         record_gzip=not record_no_gzip,
         rtc_config=rtc_cfg,
+        inject_latency_ms=inject_latency_ms,
     )
     if api_key:
         composed.append("[cyan]api-key-auth[/cyan]")

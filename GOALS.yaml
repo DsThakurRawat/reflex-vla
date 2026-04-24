@@ -541,8 +541,9 @@ goals:
   # easily copy' — exactly what our wedge is about.
 
   - id: serve-a2c2-correction-head
-    description: "A2C2 plug-in correction head (arXiv 2509.23224). Small bolt-on network that corrects RTC overshoot/undershoot on high-latency deployments (Jetson is the canonical use case). No retraining of the base VLA — just train the correction head on deployment traces. Solves 'RTC on Jetson has poor reactivity because inference takes 40-80ms'. PROMOTED to weight 10 (2026-04-22 PM) after cross-timestep cache moat falsified — A2C2 is now the #1 serve item. ~1 week of work, paper-grade win, no model retraining required. Ships as add-on to RTC wedge."
-    check: "test -f src/reflex/kernels/a2c2_correction.py 2>/dev/null"
+    description: "A2C2 plug-in correction head (arXiv 2509.23224). PARTIAL 2026-04-24 — B.4 transfer-validation gate HARNESS shipped (head module + train + validate scripts + synthetic latency injection; ~1.5k LoC, 42 tests). Gate FIRE is a one-shot user-authorized Modal A10G run (~$7, ~3 hr): train head on LeRobot LIBERO + record held-out traces with --inject-latency-ms 100 + run gate. Decision drives B.5 (full /act wiring; 5-6 days, Phase 1) go/no-go. Per ADR 2026-04-24-a2c2-gate-modal-synthetic-latency: gate fires WITHOUT Jetson (synthetic latency injection matches paper methodology); real-Jetson burn-in stays a Phase 1 pre-ship qual."
+    check: "test -d src/reflex/correction && test -f scripts/train_a2c2.py && test -f scripts/validate_a2c2_transfer.py 2>/dev/null"
+    status: in_progress
     weight: 10
 
   - id: serve-reflex-optimize-command

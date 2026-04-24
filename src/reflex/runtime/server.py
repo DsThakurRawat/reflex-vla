@@ -1038,6 +1038,7 @@ def create_app(
     record_image_redaction: str = "hash_only",
     record_gzip: bool = True,
     rtc_config: Any = None,
+    inject_latency_ms: float = 0.0,
 ) -> Any:
     """Create a FastAPI app for serving VLA predictions.
 
@@ -1052,6 +1053,15 @@ def create_app(
     `server.embodiment_config` so downstream consumers (RTC adapter,
     action denormalization, reflex doctor) can read it. See
     `src/reflex/embodiments/` and `docs/embodiment_schema.md`.
+
+    inject_latency_ms: synthetic deployment-latency injection (B.4 A2C2
+    transfer-validation gate). Adds an asyncio.sleep AFTER inference +
+    JSONL recording, so the recorded `latency_ms` reflects true compute
+    cost while the client observes inference + injected delay. Used to
+    simulate Jetson-class deployment latency on Modal A10G for the A2C2
+    transfer-validation gate. 0.0 (default) = no injection. Range
+    [0, 1000]; values outside clamp at the edges. The matching paper
+    methodology is arxiv 2509.23224 §4 ("100ms injected delay").
     """
     try:
         from contextlib import asynccontextmanager
@@ -1137,6 +1147,17 @@ def create_app(
     # (RTC adapter, action denormalization, reflex doctor) read via
     # getattr(server, 'embodiment_config', None).
     server.embodiment_config = embodiment_config
+
+    # Synthetic latency injection (B.4). Clamped to [0, 1000] ms. The
+    # /act handler sleeps for this long AFTER inference + recording so
+    # JSONL captures true compute latency while the client observes
+    # the inflated round-trip.
+    server.inject_latency_ms = max(0.0, min(1000.0, float(inject_latency_ms)))  # type: ignore[attr-defined]
+    if server.inject_latency_ms > 0:
+        logger.info(
+            "Synthetic latency injection armed: %.1f ms per /act call (B.4 A2C2 gate)",
+            server.inject_latency_ms,
+        )
 
     # Attach ActionGuard from embodiment config (B.6) — clamps actions
     # against per-axis ranges + velocity caps before /act returns. Skips
@@ -1490,6 +1511,17 @@ def create_app(
                 )
                 if rec_seq >= 0:
                     span.set_attribute("reflex.record.seq", rec_seq)
+
+            # Synthetic latency injection (B.4 A2C2 gate). Runs AFTER
+            # JSONL recording so recorded latency_ms is the true compute
+            # cost; client sees inference + injected delay. No-op when
+            # inject_latency_ms == 0.0.
+            _inj = float(getattr(server, "inject_latency_ms", 0.0) or 0.0)
+            if _inj > 0 and isinstance(result, dict) and "error" not in result:
+                import asyncio as _asyncio
+                result["injected_latency_ms"] = _inj
+                span.set_attribute("reflex.injected_latency_ms", _inj)
+                await _asyncio.sleep(_inj / 1000.0)
 
             return JSONResponse(content=result)
 
