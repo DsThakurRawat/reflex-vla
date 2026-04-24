@@ -674,6 +674,18 @@ goals:
     status: done
     weight: 7
 
+  - id: serve-one-command-deploy
+    description: "`reflex go --model X --embodiment Y` — one-command-deploy / launch-day hero command. SHIPPED 2026-04-24 as the 7th visible top-level CLI command. Pipeline: probe hardware (nvidia-smi → tegrastats → cpu fallback; 8 canonical device classes) → resolve model variant from registry given device class (3 strategies: exact-id, family+device, family-fallback; smallest-for-edge, largest-for-datacenter policy) → cache-check → pull via huggingface_hub if needed → if requires_export=True print export-then-rerun hint, else hand off to create_app + uvicorn. ~440 LoC + 245 LoC tests (29 tests). Phase 0.5 scope shipped; auto-export integration deferred to Phase 1 (heavy deps belong on Modal not the customer's edge box); auto-calibration deferred to Phase 1 (depends on D.2). Plan ref: features/01_serve/subfeatures/_dx_gaps/one-command-deploy.md."
+    check: "test -f src/reflex/runtime/hardware_probe.py && test -f src/reflex/runtime/model_resolver.py && grep -q 'def go(' src/reflex/cli.py 2>/dev/null"
+    status: done
+    weight: 9
+
+  - id: serve-e2e-test
+    description: "End-to-end integration test harness for `reflex serve`. SHIPPED 2026-04-24. Covers 8 of 10 plan cases without Modal: /health state-machine, single /act, 100 concurrent (asyncio.gather + httpx.AsyncClient), action chunk validity (shape + NaN/Inf), malformed → 4xx, guard violation → proper error, crash recovery → 503 + Retry-After: 60, prewarm-state consistency. Uses the established stub-FastAPI-app pattern (4 test files now share the convention). 2 deferred cases (latency p99, cache hit rate) need real ONNX inference — gated on a future scripts/modal_serve_e2e_perf.py firing when GMI credits land. ~290 LoC, 10 tests. Plan ref: features/01_serve/subfeatures/_dx_gaps/e2e-test.md."
+    check: "test -f tests/test_serve_e2e.py && grep -q 'TestCase07CrashRecovery' tests/test_serve_e2e.py 2>/dev/null"
+    status: done
+    weight: 9
+
   - id: serve-prometheus-grafana
     description: "/metrics Prometheus endpoint + Grafana dashboard template (12 metrics: latency histogram, cache hit/miss counters, denoise steps, safety/SLO violations, fallback invocations, model swaps, in-flight gauge, episodes active, server up). SHIPPED 2026-04-24 (commit ad03d4b; +931 lines, 20 tests). Cardinality-bounded (90 series budget; source-grep test enforces no instruction/request_id/user_id/timestamp labels). dashboards/grafana_template.json schemaVersion 39 — 5 panels, templating vars for embodiment + model_id. /metrics route in server.py has no auth (operators network-isolate per plan). Downstream features (webhooks, slo-enforcement, guard, hot-swap) import from reflex.observability instead of defining their own metrics. Plan ref: features/01_serve/subfeatures/_ecosystem/prometheus-grafana_plan.md."
     check: "test -f src/reflex/observability/prometheus.py && test -f dashboards/grafana_template.json && python -c 'from reflex.observability import render_metrics; assert b\"reflex_act_latency_seconds\" in render_metrics()' 2>/dev/null"

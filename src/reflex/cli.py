@@ -2028,11 +2028,167 @@ def models_info(
         console.print("\n[dim]No benchmarks yet. Run [cyan]reflex bench <export>[/cyan] after pull.[/dim]")
 
 
+@app.command()
+def go(
+    model: str = typer.Option(
+        "",
+        "--model",
+        help="Registry id (e.g. pi05-libero) OR family name (pi05/smolvla/pi0). "
+             "Run `reflex models list` to browse.",
+    ),
+    embodiment: str = typer.Option(
+        "",
+        "--embodiment",
+        help="Embodiment preset (franka/so100/ur5). Optional but recommended — "
+             "cross-checks dataset/action shapes.",
+    ),
+    device_class: str = typer.Option(
+        "",
+        "--device-class",
+        help="Override hardware probe (h200/h100/a100/a10g/thor/agx_orin/orin_nano/cpu). "
+             "Use when probe misclassifies.",
+    ),
+    target_dir: str = typer.Option(
+        "",
+        "--target-dir",
+        help="Where to cache weights. Default: ~/.cache/reflex/models/<id>/",
+    ),
+    port: int = typer.Option(8000, "--port", help="HTTP port for /act + /health"),
+    host: str = typer.Option("0.0.0.0", "--host"),
+    api_key: str = typer.Option("", "--api-key", help="If set, /act requires X-Reflex-Key header"),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Probe + resolve + print plan; do not pull or serve.",
+    ),
+):
+    """One-command deploy: probe hardware → pick model → pull → serve.
+
+    Examples:
+      reflex go --model pi05 --embodiment franka
+      reflex go --model smolvla-base --device-class orin_nano --port 8001
+      reflex go --model pi05-libero --dry-run
+
+    For models that ship as raw PyTorch (requires_export=True in registry),
+    this command pulls + prints the export command to run next. For models
+    that are Reflex-pre-exported (requires_export=False), it pulls + serves
+    in one shot.
+
+    Plan ref: features/01_serve/subfeatures/_dx_gaps/one-command-deploy.md
+    """
+    from reflex.runtime.hardware_probe import (
+        CANONICAL_DEVICE_CLASSES,
+        probe_device_class,
+    )
+    from reflex.runtime.model_resolver import (
+        ModelResolverError,
+        resolve_model,
+    )
+
+    if not model:
+        console.print("[red]--model is required (e.g. --model pi05-libero).[/red]")
+        console.print("Run [cyan]reflex models list[/cyan] to browse.")
+        raise typer.Exit(2)
+
+    if device_class and device_class not in CANONICAL_DEVICE_CLASSES:
+        console.print(
+            f"[red]--device-class {device_class!r} not in {CANONICAL_DEVICE_CLASSES}[/red]"
+        )
+        raise typer.Exit(2)
+
+    # Step 1: probe hardware
+    probe = probe_device_class(override=device_class or None)
+    console.print(f"[bold cyan]device:[/bold cyan]   {probe.device_class} "
+                  f"(via {probe.detection_method}{f', GPU={probe.raw_gpu_name}' if probe.raw_gpu_name else ''})")
+    for note in probe.notes:
+        console.print(f"  [yellow]note:[/yellow] {note}")
+
+    # Step 2: resolve model
+    try:
+        resolution = resolve_model(model=model, device_class=probe.device_class, embodiment=embodiment)
+    except ModelResolverError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(2)
+    entry = resolution.entry
+    console.print(f"[bold cyan]model:[/bold cyan]    {entry.model_id} "
+                  f"({entry.hf_repo}, {entry.size_mb}MB, action_dim={entry.action_dim})")
+    console.print(f"  strategy: {resolution.matched_strategy}")
+    for note in resolution.notes:
+        console.print(f"  [yellow]note:[/yellow] {note}")
+
+    # Step 3: target dir
+    target = Path(target_dir) if target_dir else (Path.home() / ".cache" / "reflex" / "models" / entry.model_id)
+
+    if dry_run:
+        console.print(f"[bold cyan]target:[/bold cyan]   {target}")
+        console.print(f"\n[bold green]DRY RUN[/bold green] — would pull weights "
+                      f"and {'print export instructions' if entry.requires_export else 'start serve on port ' + str(port)}.")
+        return
+
+    # Step 4: pull (skip if already cached + non-empty)
+    target.mkdir(parents=True, exist_ok=True)
+    if any(target.iterdir()):
+        console.print(f"[bold cyan]cache hit:[/bold cyan] {target} already populated; skipping pull.")
+    else:
+        console.print(f"[bold cyan]pulling:[/bold cyan]  {entry.hf_repo} → {target}")
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            console.print("[red]huggingface_hub not installed.[/red]")
+            raise typer.Exit(2)
+        try:
+            snapshot_download(
+                repo_id=entry.hf_repo,
+                revision=entry.hf_revision or None,
+                local_dir=str(target),
+                local_dir_use_symlinks=False,
+            )
+        except Exception as e:
+            console.print(f"[red]Download failed: {type(e).__name__}: {e}[/red]")
+            raise typer.Exit(1)
+
+    # Step 5: hand off to serve OR print export instructions
+    if entry.requires_export:
+        console.print(
+            f"\n[yellow]This model ships as raw weights and needs export first:[/yellow]\n"
+            f"  [cyan]reflex export {target}[/cyan]\n"
+            f"Then re-run [cyan]reflex go --model {entry.model_id}[/cyan] "
+            f"(it will skip the pull on the cache hit and serve the exported dir)."
+        )
+        console.print(
+            f"\n[dim]Auto-export integration is gated on Phase 1 work (large + heavy "
+            f"deps; not in `reflex go` scope today). Track at "
+            f"features/01_serve/subfeatures/_dx_gaps/one-command-deploy.md.[/dim]"
+        )
+        raise typer.Exit(0)
+
+    # requires_export=False → start serve directly
+    console.print(f"\n[bold green]Starting serve on http://{host}:{port}[/bold green]")
+    from reflex.runtime.server import create_app
+
+    embodiment_cfg = None
+    if embodiment:
+        try:
+            from reflex.embodiments import EmbodimentConfig
+            embodiment_cfg = EmbodimentConfig.load_preset(embodiment)
+        except Exception as e:
+            console.print(f"[yellow]Could not load embodiment config: {e}[/yellow]")
+
+    app_instance = create_app(
+        export_dir=str(target),
+        device="cuda" if probe.device_class != "cpu" else "cpu",
+        embodiment_config=embodiment_cfg,
+        api_key=api_key or None,
+    )
+    import uvicorn
+    uvicorn.run(app_instance, host=host, port=port, log_level="info")
+
+
 # ---------------------------------------------------------------------------
 # Verb-noun subgroups (2026-04-24 refactor — see ADR
 # 01_decisions/2026-04-24-cli-verb-noun-now-config-later-dashboard-eventually.md).
 #
-# Visible top-level: serve, doctor, models, train, validate, inspect (= 6).
+# Visible top-level: serve, doctor, models, train, validate, inspect, go (= 7).
 # Old top-level commands stay registered under hidden=True so existing scripts
 # don't break; they will be removed in v0.2.
 # ---------------------------------------------------------------------------
