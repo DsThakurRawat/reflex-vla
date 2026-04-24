@@ -11,5 +11,6 @@ Feature spec: features/01_serve/subfeatures/_dx_gaps/mcp-server/mcp-server.md
 Execution plan: features/01_serve/subfeatures/_dx_gaps/mcp-server/mcp-server_plan.md
 """
 from reflex.mcp.server import create_mcp_server
+from reflex.mcp.ros2_tools import ROS2Context, register_ros2_tools
 
-__all__ = ["create_mcp_server"]
+__all__ = ["create_mcp_server", "ROS2Context", "register_ros2_tools"]

@@ -142,6 +142,17 @@ reflex_server_up = Gauge(
     registry=REGISTRY,
 )
 
+# Info-style metric for fleet aggregation (Phase 1 fleet-telemetry feature).
+# Static per-process; labels are the only non-constant content. Grafana joins
+# other metrics to this one via `instance` to surface human-readable robot_id
+# (label cardinality stays flat — one series per process, not per request).
+reflex_robot_info = Gauge(
+    "reflex_robot_info",
+    "Static per-process robot identity. Value always 1. Join via `instance`.",
+    labelnames=("robot_id", "embodiment", "model_id"),
+    registry=REGISTRY,
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers — typed call-sites keep the surface searchable
@@ -201,6 +212,17 @@ def inc_model_swap(embodiment: str, from_model: str, to_model: str) -> None:
 def set_server_up(value: int) -> None:
     """1 when serving, 0 on graceful shutdown."""
     reflex_server_up.set(value)
+
+
+def set_robot_info(robot_id: str, embodiment: str, model_id: str) -> None:
+    """Publish the identity of this process for fleet-scope Grafana queries.
+
+    Call once at lifespan startup. Safe to call repeatedly; gauge overwrites.
+    Empty `robot_id` is treated as unset — caller should skip when so.
+    """
+    reflex_robot_info.labels(
+        robot_id=robot_id, embodiment=embodiment, model_id=model_id,
+    ).set(1)
 
 
 def set_episodes_active(embodiment: str, value: int) -> None:

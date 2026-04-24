@@ -1077,6 +1077,34 @@ def serve(
         help="MCP HTTP port (only when --mcp --mcp-transport http). Separate from "
              "--port which is the FastAPI port.",
     ),
+    otel_endpoint: str = typer.Option(
+        "",
+        "--otel-endpoint",
+        help="OTLP gRPC endpoint for trace export (e.g. 'localhost:4317' for "
+             "Phoenix, or an OTel Collector). Requires `pip install reflex-vla"
+             "[tracing]`. When unset, falls back to $OTEL_EXPORTER_OTLP_ENDPOINT "
+             "and then 'localhost:4317'. Traces include gen_ai.operation.name, "
+             "gen_ai.request.model, gen_ai.action.embodiment, gen_ai.action."
+             "chunk_size, gen_ai.action.denoise_steps per OTel GenAI SemConv.",
+    ),
+    otel_sample: float = typer.Option(
+        1.0,
+        "--otel-sample",
+        help="Trace sampling ratio [0.0, 1.0]. 1.0 = sample every /act (default, "
+             "safe for dev/staging). 0.1 = 10% sampling (OTel SemConv starting "
+             "point for high-traffic production). Uses parent-based sampler so "
+             "child spans inherit the root decision (avoids partial traces).",
+    ),
+    robot_id: str = typer.Option(
+        "",
+        "--robot-id",
+        help="Fleet-telemetry identifier for this process. When set, publishes "
+             "`reflex_robot_info{robot_id=...}` Prometheus gauge and echoes "
+             "robot_id on /health + /config responses. Customers deploying one "
+             "Reflex process per robot join this against hot metrics via "
+             "`instance` in Grafana (see dashboards/grafana/reflex-fleet.json). "
+             "When unset, no extra cardinality is added — backward compatible.",
+    ),
     verbose: bool = typer.Option(False, help="Verbose logging"),
 ):
     """Start a VLA inference server. POST /act with image + instruction → actions.
@@ -1275,6 +1303,12 @@ def serve(
         )
         raise typer.Exit(1)
 
+    if not (0.0 <= otel_sample <= 1.0):
+        console.print(
+            f"[red]--otel-sample must be in [0.0, 1.0], got {otel_sample}[/red]"
+        )
+        raise typer.Exit(1)
+
     # SLO enforcement (Phase 1 latency-slo-enforcement feature).
     # --slo required to enable; default mode is "degrade".
     slo_tracker = None
@@ -1316,6 +1350,9 @@ def serve(
         slo_tracker=slo_tracker,
         slo_mode=_slo_mode_validated,
         max_concurrent=max_concurrent if max_concurrent > 0 else None,
+        otel_endpoint=otel_endpoint or None,
+        otel_sample=otel_sample,
+        robot_id=robot_id or None,
     )
     if api_key:
         composed.append("[cyan]api-key-auth[/cyan]")
@@ -1323,6 +1360,12 @@ def serve(
         composed.append(
             f"[cyan]replan[/cyan]={replan_hz:g}Hz/execute={execute_hz:g}Hz"
         )
+    if otel_endpoint:
+        composed.append(
+            f"[cyan]otel[/cyan]={otel_endpoint}@{otel_sample:g}"
+        )
+    if robot_id:
+        composed.append(f"[cyan]robot[/cyan]={robot_id}")
     # MCP server integration (Phase 1 mcp-server feature).
     # --mcp --mcp-transport stdio: MCP-only mode (FastAPI NOT started — stdio
     #   needs to own stdin/stdout; used for Claude Desktop / Cursor).

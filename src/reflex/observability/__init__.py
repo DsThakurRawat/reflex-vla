@@ -24,6 +24,7 @@ from reflex.observability.prometheus import (
     record_act_latency,
     render_metrics,
     set_episodes_active,
+    set_robot_info,
     set_server_up,
     track_in_flight,
 )
@@ -43,5 +44,6 @@ __all__ = [
     "inc_model_swap",
     "track_in_flight",
     "set_server_up",
+    "set_robot_info",
     "set_episodes_active",
 ]

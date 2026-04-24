@@ -45,6 +45,7 @@ try:
         METRICS_CONTENT_TYPE,
         record_act_latency,
         render_metrics,
+        set_robot_info,
         set_server_up,
         track_in_flight,
     )
@@ -55,6 +56,7 @@ except ImportError:  # pragma: no cover
     def record_act_latency(*args, **kwargs): pass
     def render_metrics() -> bytes: return b"# prometheus_client not installed\n"
     def set_server_up(*args): pass
+    def set_robot_info(*args, **kwargs): pass
 
     from contextlib import contextmanager as _cm
     @_cm
@@ -1044,6 +1046,9 @@ def create_app(
     slo_tracker: Any = None,  # reflex.runtime.slo.SLOTracker
     slo_mode: str = "degrade",  # "log_only" | "503" | "degrade"
     max_concurrent: int | None = None,  # None = no limit; int → 429 when saturated
+    otel_endpoint: str | None = None,  # OTLP gRPC endpoint (e.g. "localhost:4317")
+    otel_sample: float = 1.0,  # 0.0-1.0; 1.0=sample all, 0.1=10% (OTel SemConv)
+    robot_id: str | None = None,  # fleet-telemetry: human-readable per-process identity
 ) -> Any:
     """Create a FastAPI app for serving VLA predictions.
 
@@ -1270,16 +1275,32 @@ def create_app(
     server.consecutive_crash_count = 0  # type: ignore[attr-defined]
     server.max_consecutive_crashes = int(max_consecutive_crashes)  # type: ignore[attr-defined]
     server.prewarm_enabled = bool(prewarm)  # type: ignore[attr-defined]
+    server.robot_id = robot_id or ""  # type: ignore[attr-defined]
 
     @asynccontextmanager
     async def lifespan(app):
         # Initialize OTel tracing if [tracing] extra is installed AND
         # OTEL_EXPORTER_OTLP_ENDPOINT is set (or default localhost:4317).
         # No-ops cleanly if deps absent — server behavior unchanged.
-        setup_tracing(service_name="reflex-vla")
+        setup_tracing(
+            service_name="reflex-vla",
+            endpoint=otel_endpoint,
+            sample_rate=otel_sample,
+        )
         # Prometheus liveness signal — operators rely on Prometheus's own
         # `up` metric for absent-server detection; this is defense-in-depth.
         set_server_up(1)
+        # Fleet-telemetry (Phase 1 feature): publish robot identity so Grafana
+        # can join hot metrics against `reflex_robot_info` via `instance`.
+        # Skip when unset — no cardinality cost for single-robot deploys.
+        if robot_id:
+            _ec = getattr(server, "embodiment_config", None)
+            _emb = getattr(_ec, "embodiment", None) or "custom"
+            set_robot_info(
+                robot_id=robot_id,
+                embodiment=_emb,
+                model_id=Path(server.export_dir).name or "unknown",
+            )
         if getattr(server, "embodiment_config", None) is not None:
             ec = server.embodiment_config
             logger.info(
@@ -1408,6 +1429,7 @@ def create_app(
             "vlm_loaded": getattr(server, "_vlm_loaded", False),
             "consecutive_crashes": int(getattr(server, "consecutive_crash_count", 0)),
             "max_consecutive_crashes": int(getattr(server, "max_consecutive_crashes", 5)),
+            "robot_id": getattr(server, "robot_id", "") or "",
         }
         http_status = 200 if state == "ready" else 503
         return JSONResponse(content=body, status_code=http_status)
@@ -1454,6 +1476,12 @@ def create_app(
                 _tracer.start_as_current_span("act") as span:
             span.set_attribute("gen_ai.operation.name", "act")
             span.set_attribute("gen_ai.request.model", str(server.export_dir))
+            # OTel GenAI robotics extensions (Phase 1 otel-genai-spans feature).
+            # Non-standard attrs under gen_ai.action.* — proposed for upstream
+            # OTel GenAI working group contribution (Phase 2 per spec).
+            span.set_attribute("gen_ai.action.embodiment", _emb_label)
+            # chunk_size + denoise_steps are set AFTER predict returns (we don't
+            # know them until the result is in hand). See ~line 1590 below.
             span.set_attribute(
                 "reflex.instruction",
                 request.instruction[:512] if request.instruction else "",
@@ -1591,6 +1619,15 @@ def create_app(
                     span.set_attribute(
                         "reflex.action_chunk_len", len(result["actions"])
                     )
+                    # OTel GenAI robotics extension (otel-genai-spans feature).
+                    span.set_attribute(
+                        "gen_ai.action.chunk_size", len(result["actions"])
+                    )
+                if isinstance(result, dict) and "denoise_steps" in result:
+                    span.set_attribute(
+                        "gen_ai.action.denoise_steps",
+                        int(result.get("denoise_steps", 0)),
+                    )
                 if "error" in result:
                     span.set_attribute("error.type", str(result.get("error", ""))[:200])
 
@@ -1656,7 +1693,9 @@ def create_app(
 
     @app.get("/config")
     async def config(_auth: None = Depends(_require_api_key)):
-        return JSONResponse(content=server.config)
+        cfg = dict(server.config) if isinstance(server.config, dict) else {}
+        cfg["robot_id"] = getattr(server, "robot_id", "") or ""
+        return JSONResponse(content=cfg)
 
     @app.get("/guard/status")
     async def guard_status():

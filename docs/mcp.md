@@ -104,9 +104,70 @@ By design. stdio owns stdin/stdout for MCP's bidirectional framing. For interact
 **MCP + FastAPI on same port**
 Not supported — the two transports use different protocols. `--port` is FastAPI; `--mcp-port` is MCP HTTP; they must differ.
 
+## ROS2 tools (ros2-mcp-bridge)
+
+When running `reflex ros2-serve` alongside MCP, four ROS2 tools + one resource become available. They introspect + drive a real ROS2-connected robot through the same MCP surface your agent already queries.
+
+### Tools
+
+| Tool | Purpose | Cooldown | Requires `confirm=True` |
+|---|---|---|---|
+| `get_joint_state()` | Latest `/joint_states` positions | 100 ms | — |
+| `get_camera_frame()` | Latest `/camera/image_raw` as base64 JPEG | 100 ms | — |
+| `execute_task(instruction, confirm, max_steps?)` | Runs one Reflex inference cycle + publishes the action chunk | 5 s | ✅ |
+| `emergency_stop(confirm)` | Publishes to `/reflex/e_stop` | 5 s | ✅ |
+| `robot://status` (resource) | URDF info + latest state + current task | — | — |
+
+### The `confirm=True` tripwire
+
+`execute_task` and `emergency_stop` will **reject** any call where `confirm` is not literally the boolean `True` — not truthy, not a string. Concretely:
+
+```python
+await execute_task(instruction="pick up the red block", confirm=True)
+# → runs inference + actuates
+
+await execute_task(instruction="pick up the red block")
+# → {"error": {"kind": "ConfirmationRequired", ...}}
+
+await execute_task(instruction="pick up", confirm="yes")
+# → {"error": {"kind": "ConfirmationRequired", ...}}  # not identity-True
+```
+
+This is intentional friction. An agent forgetting to pass `confirm=True` can't actuate by accident; a prompt-injection payload that tries to slip in `confirm="yes"` fails the identity check.
+
+### Rate limiting
+
+Server-side cooldowns are authoritative — clients can't bypass by issuing parallel calls. The limiter is per-tool (pending e-stop cooldown doesn't block joint-state reads) and uses `time.monotonic()` so wall-clock skew doesn't matter.
+
+Rejected calls return `{"error": {"kind": "RateLimited", "message": "... wait Xs", ...}}`. Well-behaved agents retry after the hint.
+
+### `robot://status`
+
+A JSON resource snapshot combining static robot identity (URDF path, action_dim, frame info) with the latest cached joint state + task. One-shot status for an agent picking up a new task.
+
+```json
+{
+  "embodiment": "franka",
+  "action_dim": 7,
+  "image_topic": "/camera/image_raw",
+  "state_topic": "/joint_states",
+  "action_topic": "/reflex/actions",
+  "e_stop_topic": "/reflex/e_stop",
+  "last_joint_positions": [0.0, -0.3, ...],
+  "last_task": "pick up the red block",
+  "joint_state_stale": false,
+  "snapshot_timestamp": 1750000000.0
+}
+```
+
+### CLI wiring
+
+Phase 1 ships the substrate (tools + live-node context implementation). The end-to-end `reflex ros2-serve --mcp` invocation that spins up both the rclpy node AND the MCP stdio loop is Phase 1.5.
+
 ## Feature spec
 
 - `features/01_serve/subfeatures/_dx_gaps/mcp-server/mcp-server.md`
 - `features/01_serve/subfeatures/_dx_gaps/mcp-server/mcp-server_plan.md`
+- `features/01_serve/subfeatures/_ecosystem/ros2-mcp-bridge/ros2-mcp-bridge.md` (ROS2 tools)
 
 Pattern source: [InferScope](https://github.com/rylinjames/easyinference) (sibling project at `EasyInference-main/products/inferscope/`). Reflex's MCP server lifts InferScope's FastMCP tool/resource pattern with VLA-specific tool semantics (`act` instead of `chat/completions`).

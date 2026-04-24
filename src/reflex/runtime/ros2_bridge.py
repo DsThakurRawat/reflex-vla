@@ -68,6 +68,9 @@ def create_ros2_bridge_node(
     rclpy, Node, Image, JointState, String, Float32MultiArray = _require_rclpy()
 
     class ReflexROS2Node(Node):
+        """Bridge node. Also implements the `mcp.ros2_tools.ROS2Context` protocol
+        so the ros2-mcp-bridge tools can bind directly to a live node."""
+
         def __init__(self) -> None:
             super().__init__(node_name)
             self._server = server
@@ -80,6 +83,7 @@ def create_ros2_bridge_node(
             self.create_subscription(JointState, state_topic, self._state_cb, 10)
             self.create_subscription(String, task_topic, self._task_cb, 10)
             self._action_pub = self.create_publisher(Float32MultiArray, action_topic, 10)
+            self._estop_pub = self.create_publisher(String, "/reflex/e_stop", 10)
             self._timer = self.create_timer(1.0 / max(0.1, rate_hz), self._tick)
 
             self.get_logger().info(
@@ -142,6 +146,61 @@ def create_ros2_bridge_node(
             out.data = [float(v) for chunk in actions for v in chunk]
             self._action_pub.publish(out)
             self._inference_count += 1
+
+        # ---- ROS2Context protocol (mcp.ros2_tools) --------------------------
+
+        def get_last_joint_state(self) -> list[float] | None:
+            return list(self._last_state) if self._last_state is not None else None
+
+        def get_last_image_rgb(self) -> Any:
+            return self._last_image
+
+        def get_last_task(self) -> str:
+            return self._last_task
+
+        def publish_e_stop(self) -> None:
+            msg = String()
+            msg.data = "e_stop"
+            self._estop_pub.publish(msg)
+            self.get_logger().warning("ros2-mcp e_stop published")
+
+        def run_inference(self, *, instruction: str) -> dict:
+            if self._last_image is None or self._last_state is None:
+                return {"error": "no observation available — camera or joint_state unseen"}
+            try:
+                result = self._server.predict(
+                    image=self._last_image,
+                    instruction=instruction,
+                    state=self._last_state,
+                )
+            except Exception as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
+            if isinstance(result, dict) and "actions" in result:
+                # Publish the chunk so the robot actuates, matching /_tick semantics.
+                chunks = result["actions"]
+                if chunks:
+                    out = Float32MultiArray()
+                    out.data = [float(v) for chunk in chunks for v in chunk]
+                    self._action_pub.publish(out)
+                    self._inference_count += 1
+            return {
+                **(result if isinstance(result, dict) else {}),
+                "policy_version": getattr(self._server, "export_dir", "unknown"),
+            }
+
+        @property
+        def robot_description(self) -> dict:
+            ec = getattr(self._server, "embodiment_config", None)
+            action_dim = getattr(ec, "action_dim", None)
+            embodiment = getattr(ec, "embodiment", None) or "unknown"
+            return {
+                "embodiment": embodiment,
+                "action_dim": int(action_dim) if action_dim is not None else None,
+                "image_topic": image_topic,
+                "state_topic": state_topic,
+                "action_topic": action_topic,
+                "e_stop_topic": "/reflex/e_stop",
+            }
 
     return ReflexROS2Node()
 

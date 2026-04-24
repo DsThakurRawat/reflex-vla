@@ -46,14 +46,21 @@ def _check_otel_available() -> bool:
 def setup_tracing(
     service_name: str = "reflex-vla",
     endpoint: str | None = None,
+    sample_rate: float = 1.0,
 ) -> bool:
     """Initialize an OTLP-gRPC tracer provider. Idempotent.
 
     Returns True if tracing was set up, False if the optional deps aren't
     installed (logged at INFO level — not an error).
 
-    `endpoint` defaults to `OTEL_EXPORTER_OTLP_ENDPOINT` env var or
-    `localhost:4317` (the Phoenix dev default).
+    Args:
+        service_name: `service.name` resource attribute.
+        endpoint: OTLP gRPC endpoint. Defaults to `OTEL_EXPORTER_OTLP_ENDPOINT`
+            env var or `localhost:4317` (the Phoenix dev default).
+        sample_rate: fraction of spans to sample (0.0-1.0). Default 1.0
+            (sample everything). Use < 1.0 for high-traffic production
+            deploys; the OTel SemConv doc recommends 0.1 as a starting
+            point (per otel-genai-spans.md spec).
     """
     global _TRACER_PROVIDER
 
@@ -66,6 +73,11 @@ def setup_tracing(
     if _TRACER_PROVIDER is not None:
         return True  # already initialized
 
+    if not (0.0 <= sample_rate <= 1.0):
+        raise ValueError(
+            f"sample_rate must be in [0.0, 1.0], got {sample_rate}"
+        )
+
     from opentelemetry import trace
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
         OTLPSpanExporter,
@@ -73,19 +85,23 @@ def setup_tracing(
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.trace.sampling import TraceIdRatioBased, ParentBased
 
     endpoint = endpoint or os.environ.get(
         "OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"
     )
     resource = Resource.create({"service.name": service_name})
-    provider = TracerProvider(resource=resource)
+    # Sampler: ratio-based under a parent-based shell so child spans inherit
+    # the root's sampling decision (avoids partial traces).
+    sampler = ParentBased(root=TraceIdRatioBased(sample_rate))
+    provider = TracerProvider(resource=resource, sampler=sampler)
     exporter = OTLPSpanExporter(endpoint=endpoint, insecure=True)
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
     _TRACER_PROVIDER = provider
     logger.info(
-        "OTel tracing initialized — service=%s endpoint=%s",
-        service_name, endpoint,
+        "OTel tracing initialized — service=%s endpoint=%s sample_rate=%.3f",
+        service_name, endpoint, sample_rate,
     )
     return True
 

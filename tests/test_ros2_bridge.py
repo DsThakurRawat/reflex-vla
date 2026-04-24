@@ -142,9 +142,11 @@ def test_node_construction(monkeypatch):
         node_name="test_reflex",
     )
     assert node._name == "test_reflex"
-    # 3 subs (image, state, task), 1 pub, 1 timer
+    # 3 subs (image, state, task), 2 pubs (actions, e_stop), 1 timer.
+    # e_stop publisher backs the ROS2Context.publish_e_stop used by the
+    # ros2-mcp-bridge feature; present regardless of MCP wiring.
     assert len(node._subs) == 3
-    assert len(node._pubs) == 1
+    assert len(node._pubs) == 2
     assert len(node._timers) == 1
 
 
