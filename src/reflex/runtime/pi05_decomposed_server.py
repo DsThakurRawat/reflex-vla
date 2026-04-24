@@ -149,6 +149,10 @@ class Pi05DecomposedInference:
         action_cache_max_age_steps: int = 2,
         cache_ignore_lang: bool = False,
         episode_cache_max_episodes: int = 8,
+        *,
+        cuda_graphs_enabled: bool = False,
+        cuda_graphs_embodiment: str = "unknown",
+        cuda_graphs_model_id: str = "unknown",
     ):
         """``cache_level`` controls which layer is cached:
 
@@ -196,7 +200,23 @@ class Pi05DecomposedInference:
         # runtime doesn't have GPU providers. LIBERO eval on an A100 box
         # runs ~50× faster on GPU; only use CPU explicitly when matching
         # PyTorch reference bytes (parity tests).
-        self._providers = providers or ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        #
+        # cuda_graphs_enabled=True overrides the providers list to include
+        # enable_cuda_graph=1 on the CUDA Execution Provider (Phase 1
+        # cuda-graphs feature; see ADR 2026-04-24-cuda-graphs-architecture).
+        self._cuda_graphs_enabled = cuda_graphs_enabled
+        self._cuda_graphs_embodiment = cuda_graphs_embodiment
+        self._cuda_graphs_model_id = cuda_graphs_model_id
+        if cuda_graphs_enabled:
+            from reflex.runtime.cuda_graphs import build_cuda_graph_providers
+            if providers is not None:
+                logger.warning(
+                    "cuda_graphs_enabled=True overrides user-provided providers=%s",
+                    providers,
+                )
+            self._providers = build_cuda_graph_providers(enabled=True)
+        else:
+            self._providers = providers or ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
         cfg_path = self.export_dir / "reflex_config.json"
         if not cfg_path.exists():
@@ -217,25 +237,65 @@ class Pi05DecomposedInference:
         logger.info("requested providers: %s", self._providers)
 
         logger.info("loading vlm_prefix: %s", prefix_path)
-        self._sess_prefix = ort.InferenceSession(str(prefix_path), providers=self._providers)
-        self._prefix_input_names = [i.name for i in self._sess_prefix.get_inputs()]
-        self._prefix_output_names = [o.name for o in self._sess_prefix.get_outputs()]
-        actual_prefix = self._sess_prefix.get_providers()
+        _raw_prefix = ort.InferenceSession(str(prefix_path), providers=self._providers)
+        self._prefix_input_names = [i.name for i in _raw_prefix.get_inputs()]
+        self._prefix_output_names = [o.name for o in _raw_prefix.get_outputs()]
+        actual_prefix = _raw_prefix.get_providers()
         logger.info("vlm_prefix actual providers: %s", actual_prefix)
-        if self._providers[0] == "CUDAExecutionProvider" and "CUDAExecutionProvider" not in actual_prefix:
-            logger.warning(
-                "CUDAExecutionProvider requested but NOT used for vlm_prefix — "
-                "falling back to: %s. Check that onnxruntime-gpu + cuDNN + cuBLAS + "
-                "cudart + curand + cufft + cusparse + cusolver + nvrtc libs are in "
-                "LD_LIBRARY_PATH. The image probably silently fell back to CPU.",
-                actual_prefix,
+        # When cuda_graphs_enabled: hard-fail if the CUDA EP didn't actually load
+        # (otherwise we'd silently capture CPU kernels into a useless graph).
+        # When disabled: retain the legacy warning-on-silent-fallback behavior.
+        cuda_required = self._providers[0] == "CUDAExecutionProvider" or (
+            isinstance(self._providers[0], tuple) and self._providers[0][0] == "CUDAExecutionProvider"
+        )
+        if cuda_required and "CUDAExecutionProvider" not in actual_prefix:
+            msg = (
+                f"CUDAExecutionProvider requested but NOT active for vlm_prefix "
+                f"(actual={actual_prefix}). Check that onnxruntime-gpu + cuDNN + cuBLAS + "
+                f"cudart + curand + cufft + cusparse + cusolver + nvrtc libs are in "
+                f"LD_LIBRARY_PATH."
             )
+            if cuda_graphs_enabled:
+                raise RuntimeError(f"cuda_graphs_enabled=True but {msg}")
+            logger.warning(msg)
 
         logger.info("loading expert_denoise: %s", expert_path)
-        self._sess_expert = ort.InferenceSession(str(expert_path), providers=self._providers)
-        self._expert_input_names = [i.name for i in self._sess_expert.get_inputs()]
-        actual_expert = self._sess_expert.get_providers()
+        _raw_expert = ort.InferenceSession(str(expert_path), providers=self._providers)
+        self._expert_input_names = [i.name for i in _raw_expert.get_inputs()]
+        actual_expert = _raw_expert.get_providers()
         logger.info("expert_denoise actual providers: %s", actual_expert)
+        if cuda_required and "CUDAExecutionProvider" not in actual_expert and cuda_graphs_enabled:
+            raise RuntimeError(
+                f"cuda_graphs_enabled=True but CUDAExecutionProvider NOT active for "
+                f"expert_denoise (actual={actual_expert})"
+            )
+
+        # Wrap sessions with CudaGraphWrapper when cuda-graphs is enabled.
+        # The wrapper preserves the .run() signature so call sites at
+        # _get_or_run_prefix (line ~498) and expert dispatch (line ~358)
+        # work unchanged.
+        if cuda_graphs_enabled:
+            from reflex.runtime.cuda_graphs import CudaGraphWrapper
+            self._sess_prefix = CudaGraphWrapper(
+                _raw_prefix,
+                session_name="vlm_prefix",
+                embodiment=cuda_graphs_embodiment,
+                model_id=cuda_graphs_model_id,
+            )
+            self._sess_expert = CudaGraphWrapper(
+                _raw_expert,
+                session_name="expert_denoise",
+                embodiment=cuda_graphs_embodiment,
+                model_id=cuda_graphs_model_id,
+            )
+            logger.info(
+                "cuda-graphs enabled for Pi05DecomposedInference "
+                "(embodiment=%s, model_id=%s)",
+                cuda_graphs_embodiment, cuda_graphs_model_id,
+            )
+        else:
+            self._sess_prefix = _raw_prefix
+            self._sess_expert = _raw_expert
 
         self._cache: CacheEntry | None = None
         self._stats = CacheStats()

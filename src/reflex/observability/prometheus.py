@@ -223,6 +223,92 @@ def track_in_flight(embodiment: str) -> Iterator[None]:
 
 
 # ---------------------------------------------------------------------------
+# CUDA graphs metrics (Phase 1 cuda-graphs feature)
+#
+# Per ADR 2026-04-24-cuda-graphs-architecture: two captured graphs per model
+# (vlm_prefix + expert_denoise session), one shape per (model × embodiment)
+# pair. Labels scoped to bounded enums — session ∈ {vlm_prefix, expert_denoise},
+# reason ∈ {capture_failed, replay_failed, explicit_disable}.
+#
+# Cardinality: ~(3 embodiments × 6 models × 2 sessions) = 36 series per
+# counter × 3 counters = 108 series. Within budget.
+# ---------------------------------------------------------------------------
+
+reflex_cuda_graph_captured_total = Counter(
+    "reflex_cuda_graph_captured_total",
+    "Cumulative CUDA graph captures (first successful run) per session",
+    labelnames=("embodiment", "model_id", "session"),  # session: vlm_prefix | expert_denoise
+    registry=REGISTRY,
+)
+
+reflex_cuda_graph_replayed_total = Counter(
+    "reflex_cuda_graph_replayed_total",
+    "Cumulative CUDA graph replays per session",
+    labelnames=("embodiment", "model_id", "session"),
+    registry=REGISTRY,
+)
+
+reflex_cuda_graph_eager_fallback_total = Counter(
+    "reflex_cuda_graph_eager_fallback_total",
+    "Cumulative eager fallbacks due to CUDA graph capture/replay failure",
+    labelnames=("embodiment", "model_id", "reason"),  # reason: capture_failed | replay_failed | explicit_disable
+    registry=REGISTRY,
+)
+
+# Capture is a first-time cost: ~50-200ms on small sessions, up to multi-second
+# on a full decomposed vlm_prefix. Buckets span that range.
+_CUDA_GRAPH_CAPTURE_BUCKETS = (0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0)
+reflex_cuda_graph_capture_seconds = Histogram(
+    "reflex_cuda_graph_capture_seconds",
+    "Time spent capturing CUDA graph (first run of a session)",
+    labelnames=("embodiment", "session"),
+    buckets=_CUDA_GRAPH_CAPTURE_BUCKETS,
+    registry=REGISTRY,
+)
+
+# Replay buckets match the /act latency budget — replay must stay well under
+# the request-level p99 SLO.
+_CUDA_GRAPH_REPLAY_BUCKETS = (0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250)
+reflex_cuda_graph_replay_seconds = Histogram(
+    "reflex_cuda_graph_replay_seconds",
+    "Time spent in CUDA graph replay (subsequent runs)",
+    labelnames=("embodiment", "session"),
+    buckets=_CUDA_GRAPH_REPLAY_BUCKETS,
+    registry=REGISTRY,
+)
+
+
+def inc_cuda_graph_captured(embodiment: str, model_id: str, session: str) -> None:
+    reflex_cuda_graph_captured_total.labels(
+        embodiment=embodiment, model_id=model_id, session=session
+    ).inc()
+
+
+def inc_cuda_graph_replayed(embodiment: str, model_id: str, session: str) -> None:
+    reflex_cuda_graph_replayed_total.labels(
+        embodiment=embodiment, model_id=model_id, session=session
+    ).inc()
+
+
+def inc_cuda_graph_eager_fallback(embodiment: str, model_id: str, reason: str) -> None:
+    reflex_cuda_graph_eager_fallback_total.labels(
+        embodiment=embodiment, model_id=model_id, reason=reason
+    ).inc()
+
+
+def observe_cuda_graph_capture_seconds(embodiment: str, session: str, seconds: float) -> None:
+    reflex_cuda_graph_capture_seconds.labels(
+        embodiment=embodiment, session=session
+    ).observe(seconds)
+
+
+def observe_cuda_graph_replay_seconds(embodiment: str, session: str, seconds: float) -> None:
+    reflex_cuda_graph_replay_seconds.labels(
+        embodiment=embodiment, session=session
+    ).observe(seconds)
+
+
+# ---------------------------------------------------------------------------
 # Render
 # ---------------------------------------------------------------------------
 
