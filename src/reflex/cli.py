@@ -49,7 +49,7 @@ def main(
     pass
 
 
-@app.command()
+@app.command(hidden=True)
 def export(
     model: str = typer.Argument(help="HuggingFace model ID or local checkpoint path"),
     target: str = typer.Option("desktop", help="Target hardware: orin-nano, orin, orin-64, thor, desktop"),
@@ -361,7 +361,7 @@ def export(
     console.print(f"  [cyan]reflex bench {output}[/cyan]")
 
 
-@app.command()
+@app.command(name="validate-legacy", hidden=True)
 def validate(
     target: str = typer.Argument("", help="Export directory OR HuggingFace model ID (with --pre-export)"),
     model: str = typer.Option("", help="HuggingFace model ID for PyTorch reference (auto-detect from reflex_config.json if empty)"),
@@ -577,7 +577,7 @@ def validate(
     raise typer.Exit(0 if passed else 1)
 
 
-@app.command(name="bench")
+@app.command(name="bench", hidden=True)
 def benchmark_cmd(
     export_dir: str = typer.Argument(help="Path to exported model directory"),
     iterations: int = typer.Option(100, help="Number of benchmark iterations"),
@@ -723,7 +723,7 @@ def benchmark_cmd(
                       f"({eval_result.get('episodes_completed', 0)} episodes)")
 
 
-@app.command()
+@app.command(hidden=True)
 def guard(
     action: str = typer.Argument(help="Action to check: 'init' to create config, 'check' to validate"),
     urdf: str = typer.Option("", help="URDF file path to extract joint limits"),
@@ -1203,7 +1203,7 @@ def serve(
     uvicorn.run(app_instance, host=host, port=port, log_level="info" if verbose else "warning")
 
 
-@app.command(name="ros2-serve")
+@app.command(name="ros2-serve", hidden=True)
 def ros2_serve(
     export_dir: str = typer.Argument(help="Path to exported model directory"),
     device: str = typer.Option("cuda", help="ORT execution device: cuda or cpu"),
@@ -1264,7 +1264,7 @@ def ros2_serve(
         raise typer.Exit(2)
 
 
-@app.command()
+@app.command(hidden=True)
 def replay(
     trace_file: str = typer.Argument(help="Path to recorded JSONL trace (.jsonl or .jsonl.gz)"),
     model: str = typer.Option(
@@ -1327,7 +1327,7 @@ def replay(
         raise typer.Exit(code)
 
 
-@app.command()
+@app.command(hidden=True)
 def targets():
     """List supported hardware targets."""
     table = Table(title="Supported Hardware Targets")
@@ -1349,9 +1349,12 @@ def targets():
     console.print(table)
 
 
-@app.command()
+# NOTE: this top-level `models` command was shadowed by the `models` typer
+# subgroup added in the model-zoo-cli ship (2026-04-24). Decorator removed
+# in the verb-noun refactor (same day) — function kept as dead code rather
+# than deleted to preserve any imports of `from reflex.cli import models`.
 def models():
-    """List supported VLA models and their export status."""
+    """[DEAD] Old top-level `reflex models` — shadowed by the typer subgroup."""
     from reflex.checkpoint import SUPPORTED_MODELS
 
     table = Table(title="Supported VLA Models")
@@ -1712,7 +1715,7 @@ def doctor(
             raise typer.Exit(code)
 
 
-@app.command(name="validate-dataset")
+@app.command(name="validate-dataset", hidden=True)
 def validate_dataset(
     path: str = typer.Argument(help="Path to LeRobot v3.0 dataset root (contains meta/info.json)"),
     embodiment: str = typer.Option(
@@ -2025,21 +2028,57 @@ def models_info(
         console.print("\n[dim]No benchmarks yet. Run [cyan]reflex bench <export>[/cyan] after pull.[/dim]")
 
 
+# ---------------------------------------------------------------------------
+# Verb-noun subgroups (2026-04-24 refactor — see ADR
+# 01_decisions/2026-04-24-cli-verb-noun-now-config-later-dashboard-eventually.md).
+#
+# Visible top-level: serve, doctor, models, train, validate, inspect (= 6).
+# Old top-level commands stay registered under hidden=True so existing scripts
+# don't break; they will be removed in v0.2.
+# ---------------------------------------------------------------------------
+
+train_app = typer.Typer(
+    help="Train models — finetune existing checkpoints, distill teachers into 1-NFE students."
+)
+validate_app = typer.Typer(
+    help="Pre-flight validation — datasets before training, exports before serving."
+)
+inspect_app = typer.Typer(
+    help="Diagnostic + forensic tools — bench, replay traces, hardware targets, guard state."
+)
+
+# Cross-register existing functions under the new verb-noun paths.
+# Same callable, two surface names: old hidden, new visible.
+models_app.command("export")(export)
+validate_app.command("dataset")(validate_dataset)
+validate_app.command("export")(validate)
+inspect_app.command("bench")(benchmark_cmd)
+inspect_app.command("replay")(replay)
+inspect_app.command("targets")(targets)
+inspect_app.command("guard")(guard)
+inspect_app.command("doctor")(doctor)  # also expose under inspect for completeness; doctor stays top-level too
+
 app.add_typer(models_app, name="models")
+app.add_typer(train_app, name="train")
+app.add_typer(validate_app, name="validate")
+app.add_typer(inspect_app, name="inspect")
 
 
-# Register `reflex finetune` + `reflex distill` subcommands. Lazy-import
-# protects users who don't have training deps installed — they only break
-# if they run the commands themselves.
+# Register `reflex {finetune,distill}` (legacy hidden) AND `reflex train
+# {finetune,distill}` (new). Same callable; old scripts still work.
+# Lazy-import protects users who don't have training deps installed — they
+# only break if they run the commands themselves.
 try:
     from reflex.finetune.cli import finetune_command
-    app.command(name="finetune")(finetune_command)
+    app.command(name="finetune", hidden=True)(finetune_command)
+    train_app.command("finetune")(finetune_command)
 except Exception as _finetune_import_exc:  # pragma: no cover - defensive
     pass
 
 try:
     from reflex.finetune.cli_distill import distill_command
-    app.command(name="distill")(distill_command)
+    app.command(name="distill", hidden=True)(distill_command)
+    train_app.command("distill")(distill_command)
 except Exception as _distill_import_exc:  # pragma: no cover - defensive
     pass
 
