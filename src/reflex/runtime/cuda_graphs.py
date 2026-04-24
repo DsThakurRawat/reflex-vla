@@ -115,7 +115,17 @@ class CudaGraphWrapper:
         session_name: str,
         embodiment: str,
         model_id: str,
+        already_captured: bool = False,
     ):
+        """Wrap an ORT session with capture/replay metrics.
+
+        Args:
+            already_captured: set True if the session was already capture-probed
+                by the caller (e.g., by try_capture_or_fall_back). The wrapper
+                skips the first-run capture path on next .run() and jumps straight
+                to replay semantics. Caller is responsible for having emitted the
+                captured-counter + capture-duration metrics in that case.
+        """
         if session_name not in VALID_SESSION_NAMES:
             raise ValueError(
                 f"session_name must be one of {sorted(VALID_SESSION_NAMES)}, got {session_name!r}"
@@ -124,7 +134,7 @@ class CudaGraphWrapper:
         self._session_name = session_name
         self._embodiment = embodiment
         self._model_id = model_id
-        self._captured = False  # flipped true after first successful .run()
+        self._captured = already_captured  # flipped true after first successful .run()
 
     @property
     def session(self) -> "ort.InferenceSession":
@@ -379,14 +389,8 @@ def try_capture_or_fall_back(
             model_id=model_id,
         )
 
-    # Capture succeeded. Wrap + record metrics as if this were the first .run().
-    wrapper = CudaGraphWrapper(
-        cg_session,
-        session_name=session_name,
-        embodiment=embodiment,
-        model_id=model_id,
-    )
-    wrapper._captured = True  # mark captured so subsequent .run()s go through replay path
+    # Capture succeeded. Wrap with already_captured=True so subsequent .run()s
+    # go through replay semantics (the caller does the capture path once here).
     observe_cuda_graph_capture_seconds(
         embodiment=embodiment, session=session_name, seconds=elapsed,
     )
@@ -397,4 +401,10 @@ def try_capture_or_fall_back(
         "cuda_graph.captured_at_init session=%s model=%s embodiment=%s elapsed_ms=%.1f",
         session_name, model_id, embodiment, elapsed * 1000,
     )
-    return wrapper
+    return CudaGraphWrapper(
+        cg_session,
+        session_name=session_name,
+        embodiment=embodiment,
+        model_id=model_id,
+        already_captured=True,
+    )
