@@ -10,32 +10,35 @@ Cross-framework ONNX export, edge-first serving, composable runtime wedges (safe
 
 **Something not working?** Run `reflex doctor` first — diagnoses install + GPU issues in one screen.
 
-## Quickstart — 3 commands from zero to actions
+## Quickstart — one command
 
 ```bash
-# 1. Install (v0.1 — install from GitHub until we publish to PyPI)
-# `[monolithic]` is required for the cos=+1.000000 verified export path (it pins transformers==5.3.0).
+# Install (v0.1 — from GitHub until we publish to PyPI)
 pip install 'reflex-vla[serve,gpu,monolithic] @ git+https://github.com/rylinjames/reflex-vla'
-# Or CPU-only: pip install 'reflex-vla[serve,onnx,monolithic] @ git+https://github.com/rylinjames/reflex-vla'
-# Note: GPU install requires the FULL cuDNN 9 system library (incl. libcudnn_adv.so.9),
-# not just the pip wheel. Easiest path is NVIDIA's container:
-#   docker run --gpus all -it nvcr.io/nvidia/tensorrt:24.10-py3
-#   apt-get install -y clang   # lerobot → evdev needs clang to build
-#   pip install 'reflex-vla[serve,gpu,monolithic] @ git+...'
-# `reflex serve` errors loudly if cuDNN can't load — no silent CPU fallback.
-# Easier alternative: use our published Docker image (see below).
 
-# 2. Export any supported VLA to ONNX (auto-detects model type)
-# SmolVLA fits on Orin Nano 8GB; pi0 (~12GB monolithic) needs Orin 16GB+ or desktop GPU.
-# Note: first export is 5-15 min (SmolVLA ~10min, pi0 ~7min on A100). Subsequent
-# `reflex serve` calls reuse the cached artifact and warm up in 10-70s.
-reflex export lerobot/smolvla_base --target desktop --output ./smol
+# Browse the curated model registry
+reflex models list
 
-# 3. Serve it — POST /act to get 50-step action chunks
-reflex serve ./smol --port 8000
+# One command — probe hardware → resolve model → pull → serve
+reflex go --model smolvla-base --embodiment franka
+
+# Or with explicit hardware override + Python client
+reflex go --model pi05-libero --embodiment franka --device-class a10g
 ```
 
-In another terminal:
+Then from your code:
+
+```python
+from reflex.client import ReflexClient
+
+with ReflexClient("http://localhost:8000") as client:
+    with client.episode() as ep:                       # auto episode_id, RTC reset
+        result = ep.act(image=numpy_frame, state=[0.1, 0.2, ...])
+        print(result["actions"])                       # list of action chunks
+        # 503-warming retried automatically; guard violations surface as fields
+```
+
+Or with curl:
 
 ```bash
 curl -X POST http://localhost:8000/act -H 'content-type: application/json' \
@@ -44,15 +47,37 @@ curl -X POST http://localhost:8000/act -H 'content-type: application/json' \
 
 ```json
 {
-  "actions": [[...], [...], ...],   // 50 × action_dim chunk
-  "num_actions": 50,
-  "latency_ms": 11.9,                // smolvla on A10G, full 10-step denoise
-  "denoising_steps": 10,
-  "inference_mode": "onnx_trt_fp16"  // automatic — no engine flags needed
+  "actions": [[...], [...], ...],          // 50 × action_dim chunk
+  "latency_ms": 11.9,                      // smolvla on A10G, 10-step denoise
+  "inference_mode": "onnx_trt_fp16",       // automatic — no engine flags needed
+  "guard_clamped": false                    // ActionGuard didn't have to clamp anything
 }
 ```
 
-That's it. `reflex` auto-detects whether you gave it SmolVLA / pi0 / pi0.5 / GR00T and dispatches to the right exporter. No framework-specific flags.
+`reflex go` auto-detects your hardware (NVIDIA GPU / Jetson / CPU), picks the right model variant for that device, downloads weights from HuggingFace, and starts the /act endpoint. **No editing configs, no separate `reflex export` step, no manual variant selection.** For models that ship as raw PyTorch weights, you get the export command to run next.
+
+### The 7 verbs
+
+```
+reflex go               # one-command-deploy: probe → resolve → pull → serve
+reflex serve            # explicit-config server (full flag surface)
+reflex doctor           # diagnose env + GPU + per-deploy issues
+reflex models {list, pull, info, export}    # curated registry + lifecycle
+reflex train  {finetune, distill}           # training operations
+reflex validate {dataset, export}           # pre-flight checks
+reflex inspect {bench, replay, targets, guard, doctor}   # diagnostics + forensics
+```
+
+Hidden legacy commands (`export`, `bench`, `replay`, etc.) stay callable for one release as alias bridges. Removed in v0.2.
+
+### Install notes
+
+- `[monolithic]` extra is required for the cos=+1.000000 verified export path (pins transformers==5.3.0)
+- CPU-only: `pip install 'reflex-vla[serve,onnx,monolithic] @ git+https://github.com/rylinjames/reflex-vla'`
+- GPU install needs the FULL cuDNN 9 system library (not just the pip wheel). Easiest path: NVIDIA's container `docker run --gpus all -it nvcr.io/nvidia/tensorrt:24.10-py3`, then `apt-get install -y clang` (for lerobot→evdev), then the pip install
+- `reflex serve` errors loudly if cuDNN can't load — no silent CPU fallback
+- First `reflex go` downloads weights (~1-14 GB depending on model) — cached on subsequent runs
+- First serve takes 10-70s warmup; `/health` returns HTTP 503 until ready, HTTP 200 after — load balancers correctly skip the server during warmup
 
 ### Docker — zero-install serve
 
@@ -77,6 +102,8 @@ Wraps the inference loop as a ROS2 node. Subscribes to `sensor_msgs/Image`, `sen
 # rclpy is NOT pip-installable. Install ROS2 via apt or robostack first:
 source /opt/ros/humble/setup.bash   # or iron / jazzy
 
+# Hidden alias — kept for back-compat through v0.2; will fold into
+# `reflex serve --transport ros2` in a future release.
 reflex ros2-serve ./my_export \
   --image-topic /camera/image_raw \
   --state-topic /joint_states \
@@ -89,13 +116,16 @@ Inference respects `--safety-config` (same limits file as HTTP serve).
 
 When `onnxruntime-gpu` ships with the TensorRT execution provider (it does in v1.20+), `reflex serve` uses TRT FP16 automatically and caches the engine in `<export_dir>/.trt_cache` so subsequent server starts skip the engine-build cost. The first `reflex serve` takes ~30-90s to warm up; restart is ~1-2s.
 
-## Validation — round-trip ONNX vs PyTorch parity
+## Pre-flight validation
 
-After exporting, run `reflex validate` to confirm the ONNX graph matches the PyTorch reference within numerical tolerance:
+Before deploying, validate your dataset (will it train?) and your export (does it serve cleanly?):
 
 ```bash
-# After exporting, validate that ONNX parity holds vs the reference:
-reflex validate ./p0 --model lerobot/pi0_base --threshold 1e-4
+# Dataset: 8 falsifiable checks against your LeRobot v3.0 corpus
+reflex validate dataset /path/to/lerobot_data --embodiment franka --strict
+
+# Export: round-trip ONNX vs PyTorch parity at machine-precision threshold
+reflex validate export ./p0 --model lerobot/pi0_base --threshold 1e-4
 ```
 
 Sample passing output (abbreviated):
@@ -137,7 +167,7 @@ The response JSON surfaces telemetry from each enabled wedge so you can see what
 | GR00T N1.6 | `nvidia/GR00T-N1.6-3B` | 3.29B | ONNX + validated (max_diff=8.34e-07, **live VLM conditioning**) |
 | OpenVLA | `openvla/openvla-7b` | 7.5B | `optimum-cli export onnx` + `reflex.postprocess.openvla.decode_actions` |
 
-`reflex models` lists current support at any time. OpenVLA is a vanilla Llama-2-7B VLM — there's no custom action expert to reconstruct, so we defer to the standard HuggingFace export path and ship only the bin-to-continuous postprocess helper.
+`reflex models list` browses the curated registry; `reflex models info <id>` shows benchmarks; `reflex models pull <id>` downloads. OpenVLA is a vanilla Llama-2-7B VLM — there's no custom action expert to reconstruct, so we defer to the standard HuggingFace export path and ship only the bin-to-continuous postprocess helper.
 
 ## Hardware targets
 
@@ -151,22 +181,25 @@ The response JSON surfaces telemetry from each enabled wedge so you can see what
 
 **Memory fit (monolithic ONNX on disk, FP32):** SmolVLA 1.6GB, pi0 12.5GB, pi0.5 13.0GB, GR00T 4.4GB. SmolVLA fits comfortably on Orin Nano 8GB; **pi0 realistically needs Orin 16GB+ or a desktop NVIDIA GPU** — the 12.5GB monolithic ONNX cannot load on the 8GB Orin Nano even in FP16 (~6GB weights plus activations + OS). FP16 engine rebuild + Orin Nano fit work is tracked for v0.3.
 
-`reflex targets` lists current profiles.
+`reflex inspect targets` lists current profiles.
 
-## The 7 wedges (+ 1 planned)
+## Composable runtime wedges
 
+Each wedge is a flag on `reflex serve` (also flowed through `reflex go`):
+
+```bash
+reflex serve ./p0 \
+  --embodiment franka \                   # per-robot action ranges + ActionGuard clamping
+  --safety-config ./robot_limits.json \   # URDF-derived joint limits + EU AI Act audit log
+  --adaptive-steps \                      # stop denoise loop early on velocity convergence
+  --deadline-ms 33 \                      # return last-known-good action if over budget
+  --cloud-fallback http://cloud:8000 \    # edge-first with cloud backup
+  --inject-latency-ms 0 \                 # synthetic delay (B.4 A2C2 gate methodology)
+  --record /tmp/traces \                  # JSONL request/response capture for replay
+  --max-consecutive-crashes 5             # circuit breaker (503 + Retry-After: 60 on trip)
 ```
-reflex export   # checkpoint → ONNX + TensorRT
-reflex serve    # HTTP inference server, composable wedges
-reflex guard    # URDF-derived safety limits + EU AI Act logging
-reflex turbo    # adaptive denoising (stops early on convergence)
-reflex split    # cloud-edge orchestration with fallback modes
-reflex adapt    # cross-embodiment action-space mapping
-reflex check    # 5 pre-deployment checks (loadable, size, structure, dtype, nan_inf)
-reflex distill  # [planned] flow-matching step distillation (10 → 2)
-```
 
-Each wedge works standalone for scripting, and every wedge that belongs in the inference path is composable through `reflex serve` flags.
+Every response surfaces telemetry from each enabled wedge (`guard_clamped`, `guard_violations`, `injected_latency_ms`, `inference_mode`, etc.).
 
 ## What Reflex is and isn't
 
