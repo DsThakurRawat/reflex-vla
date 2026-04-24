@@ -1434,16 +1434,61 @@ def check(
 
 
 @app.command()
-def doctor():
-    """Diagnose common Reflex install + GPU issues. Run this BEFORE opening a bug.
+def doctor(
+    model: str = typer.Option(
+        "",
+        "--model",
+        help="Optional path to an exported model directory. When passed, runs "
+             "deploy diagnostics (5 falsifiable checks for known LeRobot async "
+             "issues + systemic VLA deploy failures) AFTER the system probe. "
+             "Without --model, runs system probe only.",
+    ),
+    embodiment: str = typer.Option(
+        "custom",
+        "--embodiment",
+        help="Embodiment preset (franka/so100/ur5) for deploy-diagnostic cross-checks. "
+             "Only used when --model is also passed.",
+    ),
+    rtc: bool = typer.Option(
+        False,
+        "--rtc",
+        help="Validate RTC chunk-boundary alignment in deploy diagnostics. "
+             "Only used when --model is also passed.",
+    ),
+    output_format: str = typer.Option(
+        "human",
+        "--format",
+        help="Output format for deploy diagnostics: 'human' (table) or 'json' "
+             "(machine-readable, schema_version=1). System probe is always human-readable.",
+    ),
+    skip: list[str] = typer.Option(
+        [],
+        "--skip",
+        help="Deploy-diagnostic check IDs to skip. Repeatable.",
+    ),
+):
+    """Diagnose Reflex install + GPU issues + (optionally) per-deploy issues.
 
-    Checks Python version, torch + CUDA availability, ONNX Runtime install
-    + execution providers, TensorRT (trtexec), HuggingFace Hub auth, and
-    common version mismatches that cause the silent CPU fallback footgun.
+    Two modes:
+      reflex doctor                              # system probe (Python, CUDA,
+                                                 # ORT providers, fastapi, etc.)
+      reflex doctor --model ./export/pi05 \\     # system probe + 5 deploy checks
+                    --embodiment franka          # against your specific export
+
+    Exit codes: 0 all pass, 1 at least one deploy-check fail, 2 invocation error,
+    3 environment error.
+
+    Plan: features/01_serve/subfeatures/_dx_gaps/reflex-doctor_plan.md
     """
     import platform
     import shutil
     import sys
+
+    if output_format not in ("human", "json"):
+        console.print(
+            f"[red]--format must be 'human' or 'json', got {output_format!r}[/red]"
+        )
+        raise typer.Exit(2)
 
     table = Table(title="Reflex Doctor")
     table.add_column("Check", style="cyan", no_wrap=True)
@@ -1600,6 +1645,38 @@ def doctor():
         "[cyan]docs/getting_started.md → Troubleshooting[/cyan] before "
         "opening an issue.[/dim]"
     )
+
+    # Deploy diagnostics — only when --model is passed (B.4 Day 1 + future)
+    if model:
+        from reflex.diagnostics import (
+            exit_code as _exit_code,
+            format_human,
+            format_json,
+            run_all_checks,
+        )
+
+        console.print()
+        console.print("[bold]Deploy diagnostics:[/bold]")
+        console.print()
+
+        results = run_all_checks(
+            model_path=model,
+            embodiment_name=embodiment,
+            rtc=rtc,
+            skip=skip,
+        )
+        if output_format == "json":
+            console.print(format_json(
+                results,
+                model_path=model,
+                embodiment_name=embodiment,
+            ))
+        else:
+            console.print(format_human(results))
+
+        code = _exit_code(results)
+        if code != 0:
+            raise typer.Exit(code)
 
 
 # Register `reflex finetune` + `reflex distill` subcommands. Lazy-import
