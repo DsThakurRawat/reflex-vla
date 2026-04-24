@@ -401,4 +401,25 @@ Keep these architectural wins from our current implementation:
 
 ---
 
+## Sibling project: EasyInference (NOT a competitor — own project; pattern source for Phase 1)
+
+**Path:** `/Users/romirjain/Desktop/building projects/EasyInference-main/`
+
+EasyInference is a sibling open-source project (2 products: ISB-1 benchmark standard + InferScope CLI/MCP). It targets LLM inference (H100/H200/B200/GB200/MI300X/MI355X), not VLA inference. Different unit-of-work (tokens vs action chunks), different latency model (ms-per-token vs ms-per-chunk × control rate), different customer (chatbot ops vs robotics engineers). NOT cloned into `reference/` because the convention there is competitor-OSS-grep-first. This is a SIBLING — pattern source, not benchmark target.
+
+**Phase 1 features that should lift InferScope patterns:**
+
+| Reflex feature (Phase 1) | InferScope pattern to lift | VLA-specific adaptation |
+|---|---|---|
+| `reflex bench` revamp (D.7) | ISB-1 measurement methodology — warmup discard, p50/p95/p99 + tail latency, jitter calc, Markdown + JSON report | Per-chunk vs per-token; account for diffusion-loop denoise steps; flow-matching reproducibility seeds |
+| `mcp-server` (planned) | InferScope MCP scaffolding — tools registration, transport wiring, prompt patterns | Expose `/act` as the tool (not `/chat/completions`); state + image inputs; episode_id in tool params |
+| `latency-slo-enforcement` (--slo p99=Xms) | InferScope SLO violation rolling-window tracker + degradation strategy | Latency unit = chunk; threshold check pairs with `--adaptive-steps` + `--deadline-ms`; 503 + measured p99 in body |
+| `model_resolver.py` cloud half (shipped) | ISB-1 hardware DB (H100/H200/B200/GB200/MI300X/MI355X cost + throughput) | Consume for cloud-side training-substrate decisions; keep our Jetson-side DB for edge decisions |
+
+**Workflow when building any Phase 1 feature with an InferScope analog:**
+1. Open the matching code under `EasyInference-main/products/{isb1,inferscope}/`
+2. Internalize the design (notebook to scratch file)
+3. Write Reflex's analogous version with VLA-aware semantics
+4. **Do NOT vendor the code** — copy patterns, write fresh. Avoids two-codebases-out-of-sync drift.
+
 **End of Audit. Next step: prioritize v0.2 features above and start implementation.**
