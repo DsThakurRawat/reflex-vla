@@ -645,8 +645,14 @@ goals:
 
   - id: serve-uptime-99-9
     description: "reflex serve uptime ≥ 99.9% over rolling 30 days, validated via Prometheus alerts. SLA claim load-bearing for enterprise customers. Pairs with Phase 0.5 prewarm + crash-recovery."
-    check: "grep -q 'reflex_server_up' src/reflex/runtime/metrics.py 2>/dev/null"
+    check: "grep -q 'reflex_server_up' src/reflex/observability/prometheus.py 2>/dev/null"
     weight: 10
+
+  - id: serve-prometheus-grafana
+    description: "/metrics Prometheus endpoint + Grafana dashboard template (12 metrics: latency histogram, cache hit/miss counters, denoise steps, safety/SLO violations, fallback invocations, model swaps, in-flight gauge, episodes active, server up). SHIPPED 2026-04-24 (commit ad03d4b; +931 lines, 20 tests). Cardinality-bounded (90 series budget; source-grep test enforces no instruction/request_id/user_id/timestamp labels). dashboards/grafana_template.json schemaVersion 39 — 5 panels, templating vars for embodiment + model_id. /metrics route in server.py has no auth (operators network-isolate per plan). Downstream features (webhooks, slo-enforcement, guard, hot-swap) import from reflex.observability instead of defining their own metrics. Plan ref: features/01_serve/subfeatures/_ecosystem/prometheus-grafana_plan.md."
+    check: "test -f src/reflex/observability/prometheus.py && test -f dashboards/grafana_template.json && python -c 'from reflex.observability import render_metrics; assert b\"reflex_act_latency_seconds\" in render_metrics()' 2>/dev/null"
+    status: done
+    weight: 6
 
   - id: serve-slo-enforcement
     description: "reflex serve --slo p99=Xms rejects requests exceeding user-set latency threshold; returns 503 SLO_VIOLATED with structured error. Reliability §3 metric in METRICS.md. Bet-your-business credibility for Pro tier."
