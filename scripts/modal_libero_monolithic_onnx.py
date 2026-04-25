@@ -551,6 +551,13 @@ def main(
         onnx_subdir=onnx_subdir,
     )
     print("\n=== RESULT ===")
+    # Early-return failure path (e.g., ONNX missing on volume) — surface
+    # the status + reason so operators don't see opaque '?' counts.
+    # Caught by 2026-04-25 eval-as-a-service Modal smoke validation.
+    if r.get("status") == "fail":
+        print(f"  status: FAIL")
+        print(f"  reason: {r.get('reason', '(no reason)')}")
+        return
     print(f"  success_rate: {r.get('success_rate_pct', '?')}%")
     print(f"  total: {r.get('total_success', '?')}/{r.get('total_eps', '?')}")
     print(f"  errors: {len(r.get('errors', []))}")
