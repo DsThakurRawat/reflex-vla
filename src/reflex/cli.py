@@ -776,6 +776,253 @@ def benchmark_cmd(
                       f"({eval_result.get('episodes_completed', 0)} episodes)")
 
 
+# ---------------------------------------------------------------------------
+# `reflex eval` — task-success evaluation (correctness, not latency)
+# Per ADR 2026-04-25-eval-as-a-service-architecture: top-level verb that
+# wraps the existing Modal image + osmesa/MuJoCo recipe + vla-eval adapter.
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="eval")
+def eval_cmd(
+    export_dir: str = typer.Argument(
+        help="Path to exported model directory (output of `reflex export`)",
+    ),
+    suite: str = typer.Option(
+        "libero", "--suite",
+        help="Eval suite. Phase 1 ships LIBERO only; SimplerEnv is Phase 2.",
+    ),
+    num_episodes: int = typer.Option(
+        3, "--num-episodes",
+        help="Episodes per task. Default 3 = smoke; researchers reproducing "
+             "published numbers pass 50-100. Wall-clock scales linearly.",
+    ),
+    tasks: str = typer.Option(
+        "", "--tasks",
+        help="Comma-separated task list. Empty (default) = all suite tasks "
+             "(LIBERO ships 4 task families: spatial / object / goal / 10).",
+    ),
+    runtime: str = typer.Option(
+        "modal", "--runtime",
+        help="modal | local. Modal uses the bundled debian_slim+osmesa "
+             "image (turnkey). local needs Linux x86_64 + the [eval-local] "
+             "extra; NEVER silently falls back to Modal.",
+    ),
+    seed: int = typer.Option(
+        0, "--seed",
+        help="RNG seed. Default 0 matches `reflex bench`. Pass --seed 7 to "
+             "reproduce prior modal_libero_*.py published results.",
+    ),
+    max_parallel: int = typer.Option(
+        1, "--max-parallel",
+        help="Max concurrent tasks. Phase 1 honors only when the runtime "
+             "supports it (Modal yes, local no).",
+    ),
+    cost_preview: bool = typer.Option(
+        False, "--cost-preview",
+        help="Dry-run: estimate $ cost without invoking the suite. Useful "
+             "before kicking off a 100-ep × 90-task run.",
+    ),
+    video: bool = typer.Option(
+        False, "--video",
+        help="Emit per-episode MP4 to <output>/videos/. Encoded at quality "
+             "cap of ~10MB/episode. Phase 1 local-only; HF Hub upload Phase 2.",
+    ),
+    output: str = typer.Option(
+        "./eval_output", "--output",
+        help="Directory for JSON envelope + (optional) videos. Created if "
+             "missing.",
+    ),
+    preflight_timeout: float = typer.Option(
+        300.0, "--preflight-timeout",
+        help="Seconds for the LIBERO smoke test. Cold osmesa scene-compile "
+             "can take 60-180s on first run; raise on cold containers.",
+    ),
+    verbose: bool = typer.Option(False, help="Verbose logging"),
+):
+    """Run task-success eval (LIBERO success rate + per-task numbers + optional video).
+
+    Wraps the existing Modal image + osmesa/MuJoCo recipe + vla-eval adapter.
+    Pre-flight smoke test catches 4-of-5 documented LIBERO failure modes
+    before the expensive run starts.
+
+    Examples:
+        reflex eval ./my-export --suite libero --num-episodes 3
+        reflex eval ./my-export --suite libero --num-episodes 50 --video
+        reflex eval ./my-export --runtime local --tasks libero_spatial
+        reflex eval ./my-export --cost-preview --num-episodes 100
+    """
+    _setup_logging(verbose)
+
+    from reflex.eval.libero import (
+        ALL_RUNTIMES,
+        LiberoSuite,
+        LiberoSuiteConfig,
+    )
+    from reflex.eval.preflight import PreflightSmokeTest
+    from reflex.eval.runner_dispatch import default_libero_tasks, resolve_task_runner
+
+    # ---- Validate inputs at the CLI layer (fail loud) ----
+    export_path = Path(export_dir)
+    if not export_path.exists():
+        console.print(f"[red]Export directory not found: {export_dir}[/red]")
+        raise typer.Exit(1)
+
+    if suite != "libero":
+        console.print(
+            f"[red]Unknown suite: {suite!r}. Phase 1 ships LIBERO only.[/red]\n"
+            f"  Phase 2 will add: simpler, customer."
+        )
+        raise typer.Exit(2)
+
+    if runtime not in ALL_RUNTIMES:
+        console.print(
+            f"[red]Unknown runtime: {runtime!r}. "
+            f"Choose one of: {', '.join(ALL_RUNTIMES)}[/red]"
+        )
+        raise typer.Exit(2)
+
+    # Parse comma-separated tasks (empty → use suite defaults)
+    parsed_tasks: tuple[str, ...] = tuple(
+        t.strip() for t in tasks.split(",") if t.strip()
+    ) if tasks else ()
+
+    # Build config — validates num_episodes, max_parallel, episode_timeout_s
+    try:
+        config = LiberoSuiteConfig(
+            num_episodes=num_episodes,
+            tasks=parsed_tasks,
+            runtime=runtime,
+            video=video,
+            output_dir=output,
+            seed=seed,
+            max_parallel=max_parallel,
+            cost_preview=cost_preview,
+        )
+    except ValueError as exc:
+        console.print(f"[red]Invalid configuration: {exc}[/red]")
+        raise typer.Exit(2)
+
+    # ---- Banner echo ----
+    console.print("\n[bold]Reflex Eval[/bold]")
+    console.print(f"  Export:      {export_dir}")
+    console.print(f"  Suite:       [cyan]{suite}[/cyan]")
+    console.print(f"  Runtime:     [cyan]{runtime}[/cyan]")
+    console.print(f"  Episodes:    {num_episodes} per task")
+    if parsed_tasks:
+        console.print(f"  Tasks:       {', '.join(parsed_tasks)}")
+    else:
+        console.print(f"  Tasks:       [dim](suite defaults)[/dim]")
+    console.print(f"  Seed:        {seed}")
+    console.print(f"  Output:      {output}")
+    if video:
+        console.print(f"  Video:       [cyan]on[/cyan] (per-episode MP4)")
+    if cost_preview:
+        console.print(f"  Mode:        [yellow]COST PREVIEW (no run)[/yellow]")
+
+    # ---- Cost preview short-circuit (Day 4 wires the real cost model) ----
+    if cost_preview:
+        # Day 3 placeholder: number-of-episodes × number-of-tasks math.
+        # Day 4 (cost_model.py) replaces this with baked $/episode × runtime
+        # × suite table.
+        n_tasks = len(parsed_tasks) if parsed_tasks else len(default_libero_tasks())
+        total_episodes = n_tasks * num_episodes
+        console.print(
+            f"\n[yellow]Cost preview (Day 4 wires the real $/ep table):[/yellow]\n"
+            f"  Estimated episodes: {total_episodes} ({n_tasks} tasks × "
+            f"{num_episodes} eps)\n"
+            f"  Real $/ep table ships Day 4 — see eval-as-a-service plan."
+        )
+        raise typer.Exit(0)
+
+    # ---- Pre-flight smoke test (catches 4-of-5 LIBERO failure modes) ----
+    console.print(
+        f"\n[dim]Pre-flight smoke test "
+        f"(timeout: {preflight_timeout:.0f}s)...[/dim]"
+    )
+    preflight_result = PreflightSmokeTest.run(timeout_s=preflight_timeout)
+    if not preflight_result.passed:
+        console.print(
+            f"\n[red]Pre-flight FAILED[/red] "
+            f"({preflight_result.failure_mode}, "
+            f"{preflight_result.elapsed_s:.1f}s)\n"
+            f"\n[bold]Remediation:[/bold]\n  {preflight_result.remediation}\n"
+        )
+        if preflight_result.stderr:
+            console.print(
+                f"[dim]Subprocess stderr (last 500 chars):[/dim]\n"
+                f"{preflight_result.stderr[-500:]}"
+            )
+        raise typer.Exit(4)
+    console.print(
+        f"  [green]Pre-flight OK[/green] ({preflight_result.elapsed_s:.1f}s)"
+    )
+
+    # ---- Resolve task runner + dispatch ----
+    # Day 3: stub runners emit adapter_error episodes with deferral message.
+    # Day 4 wires the Modal subprocess wrapper; Day 5 wires the local runner.
+    task_runner = resolve_task_runner(runtime=runtime, export_dir=export_path)
+    tasks_provider = (
+        None if parsed_tasks else default_libero_tasks
+    )
+
+    console.print(f"\n[dim]Running suite...[/dim]")
+    report = LiberoSuite.run(
+        export_dir=export_path,
+        config=config,
+        task_runner=task_runner,
+        tasks_provider=tasks_provider,
+    )
+
+    # ---- Render summary ----
+    console.print(
+        f"\n[bold]Eval complete[/bold] "
+        f"({report.wall_clock_s:.1f}s wall-clock)"
+    )
+    console.print(
+        f"  Aggregate success: [bold]"
+        f"{report.aggregate_success_rate * 100:.1f}%[/bold] "
+        f"({report.aggregate_n_success}/{report.aggregate_n_total} episodes)"
+    )
+    if report.results:
+        console.print(f"\n[bold]Per-task results:[/bold]")
+        per_task = Table(show_header=True, box=None, padding=(0, 2))
+        per_task.add_column("Task", style="cyan")
+        per_task.add_column("Success", justify="right")
+        per_task.add_column("N", justify="right")
+        for r in report.results:
+            per_task.add_row(
+                r.task_id,
+                f"{r.success_rate * 100:.1f}%",
+                f"{r.n_success}/{r.n_total}",
+            )
+        console.print(per_task)
+
+    # JSON envelope wiring is Day 4 (cost_model + report.py); Day 3 substrate
+    # only prints to console. Output dir is created here for forward-compat.
+    output_path = Path(output)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Honest signaling: if EVERY episode is adapter_error (because Day 3 stub
+    # runners always do that), exit non-zero so CI doesn't think it succeeded.
+    all_adapter_error = (
+        report.aggregate_n_total > 0
+        and report.aggregate_n_success == 0
+        and all(
+            ep.terminal_reason == "adapter_error"
+            for r in report.results
+            for ep in r.episodes
+        )
+    )
+    if all_adapter_error:
+        console.print(
+            "\n[yellow]All episodes returned adapter_error[/yellow] — Day 3 "
+            "ships the CLI substrate; the runtime task runner wires Day 4-5. "
+            "Use --cost-preview for a no-run cost estimate."
+        )
+        raise typer.Exit(5)
+
+
 @app.command(hidden=True)
 def guard(
     action: str = typer.Argument(help="Action to check: 'init' to create config, 'check' to validate"),
