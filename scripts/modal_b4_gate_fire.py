@@ -166,6 +166,9 @@ def fire_gate(
             "--port", "8000",
             "--device", "cuda",
             "--no-strict-providers",
+            "--no-prewarm",  # gate fires synthetic requests; full prewarm
+                             # adds 60-90s + risks /health timeout per
+                             # 2026-04-25 re-fire failure log
             "--inject-latency-ms", str(latency_ms),
             "--record", str(traces_dir),
             "--record-no-gzip",
@@ -174,9 +177,13 @@ def fire_gate(
         env = {**os.environ}
         proc = subprocess.Popen(cmd, env=env)
         try:
-            if not wait_for_health("http://127.0.0.1:8000/health", 240):
+            # 480s budget covers cold-container model load (~30-60s) +
+            # ORT session creation (~30s) + lifespan startup (~5s).
+            # Was 240s; bumped 2026-04-25 after re-fire failure (server
+            # came up but exceeded the old budget).
+            if not wait_for_health("http://127.0.0.1:8000/health", 480):
                 proc.terminate()
-                raise RuntimeError(f"server didn't come up in 240s for latency={latency_ms}")
+                raise RuntimeError(f"server didn't come up in 480s for latency={latency_ms}")
             n_total = n_episodes_per_run * chunk_size_per_episode
             print(f"[latency={latency_ms}ms] sending {n_total} requests")
             t0 = time.time()
