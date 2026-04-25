@@ -926,6 +926,189 @@ class GreedyResolver:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Passive warm-up tracker (Day 5) — derives latency_compensation_ms from
+# real /act traffic without an active boot-time probe.
+# ---------------------------------------------------------------------------
+
+
+class CalibrationWarmupTracker:
+    """Rolling-window p95 stability detector that writes back to the cache.
+
+    Per ADR 2026-04-25-auto-calibration-architecture:
+    - No active probe at boot (avoid unintended first-move)
+    - Cold-start: use embodiment default (franka 40ms, etc.)
+    - Warm-up: sample real /act latencies; when p95 is stable for
+      `stable_count` consecutive observations within `tolerance_ms`, write
+      the new latency_compensation_ms to the cache entry + persist atomically
+
+    Composition:
+    - Created by `create_app()` lifespan when `--auto-calibrate` is set
+    - `record_latency(latency_ms)` called from /act handler post-flush
+    - `maybe_persist()` called periodically; returns True when a write
+      happened. Caller (the /act handler) doesn't have to await — it's
+      a synchronous in-memory op + atomic disk write
+    """
+
+    __slots__ = (
+        "_cache", "_cache_path", "_embodiment", "_model_hash",
+        "_window", "_stable_observations", "_window_size",
+        "_tolerance_ms", "_stable_count_target", "_min_samples_to_persist",
+        "_last_persisted_value_ms", "_lock",
+    )
+
+    def __init__(
+        self,
+        *,
+        cache: CalibrationCache,
+        cache_path: str | Path,
+        embodiment: str,
+        model_hash: str,
+        window_size: int = 100,
+        tolerance_ms: float = 5.0,
+        stable_count_target: int = 3,
+        min_samples_to_persist: int = 30,
+    ):
+        if window_size < 1:
+            raise ValueError(f"window_size must be >= 1, got {window_size}")
+        if tolerance_ms < 0:
+            raise ValueError(f"tolerance_ms must be >= 0, got {tolerance_ms}")
+        if stable_count_target < 1:
+            raise ValueError(
+                f"stable_count_target must be >= 1, got {stable_count_target}"
+            )
+        if min_samples_to_persist < 1:
+            raise ValueError(
+                f"min_samples_to_persist must be >= 1, got {min_samples_to_persist}"
+            )
+        if not embodiment:
+            raise ValueError("embodiment must be non-empty")
+        if not model_hash:
+            raise ValueError("model_hash must be non-empty")
+        import collections
+        import threading
+        self._cache = cache
+        self._cache_path = Path(cache_path)
+        self._embodiment = embodiment
+        self._model_hash = model_hash
+        self._window: collections.deque[float] = collections.deque(maxlen=window_size)
+        self._window_size = window_size
+        self._tolerance_ms = float(tolerance_ms)
+        self._stable_count_target = int(stable_count_target)
+        self._min_samples_to_persist = int(min_samples_to_persist)
+        self._stable_observations = 0
+        self._last_persisted_value_ms: float | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def sample_count(self) -> int:
+        with self._lock:
+            return len(self._window)
+
+    @property
+    def stable_observations(self) -> int:
+        with self._lock:
+            return self._stable_observations
+
+    @property
+    def last_persisted_value_ms(self) -> float | None:
+        return self._last_persisted_value_ms
+
+    def record_latency(self, latency_ms: float) -> None:
+        """Record one /act-completed wall-clock latency. Drops non-positive +
+        NaN values silently — hot-path reliability beats strict validation."""
+        if latency_ms <= 0 or latency_ms != latency_ms:  # rejects NaN
+            return
+        with self._lock:
+            self._window.append(float(latency_ms))
+
+    def current_p95_ms(self) -> float | None:
+        """Returns None when there aren't enough samples to form a stable
+        estimate (< min_samples_to_persist)."""
+        with self._lock:
+            n = len(self._window)
+            if n < self._min_samples_to_persist:
+                return None
+            samples_sorted = sorted(self._window)
+        return _percentile(samples_sorted, 0.95)
+
+    def maybe_persist(self) -> bool:
+        """Check whether the rolling p95 is stable enough to write back to
+        the cache + persist. Returns True when a write happened.
+
+        Stability rule: the current p95 must be within `tolerance_ms` of
+        the LAST persisted value for `stable_count_target` consecutive
+        calls. On the first persist (no prior value), we only require
+        `min_samples_to_persist` samples.
+        """
+        current = self.current_p95_ms()
+        if current is None:
+            return False
+
+        with self._lock:
+            last = self._last_persisted_value_ms
+            if last is not None and abs(current - last) <= self._tolerance_ms:
+                self._stable_observations += 1
+            else:
+                self._stable_observations = 1
+                # Don't immediately persist on first sample — need more
+                # observations to confirm stability.
+                if last is not None:
+                    self._last_persisted_value_ms = current
+                    return False
+
+            should_persist = (
+                last is None  # first persist after warmup
+                or self._stable_observations >= self._stable_count_target
+            )
+            if not should_persist:
+                return False
+
+            # Lookup the existing entry for (embodiment, model_hash); if
+            # absent, we can't write back (resolver must run first to
+            # create it). Day 5 only persists when an entry already exists.
+            entry = self._cache.lookup(
+                embodiment=self._embodiment, model_hash=self._model_hash,
+            )
+            if entry is None:
+                return False
+
+            # Construct an updated entry with the new latency_compensation_ms.
+            updated = CalibrationEntry(
+                chunk_size=entry.chunk_size,
+                nfe=entry.nfe,
+                latency_compensation_ms=current,
+                provider=entry.provider,
+                variant=entry.variant,
+                measurement_quality=entry.measurement_quality,
+                measurement_context=entry.measurement_context,
+                timestamp=_utcnow_iso(),
+            )
+            self._cache.record(
+                embodiment=self._embodiment,
+                model_hash=self._model_hash,
+                entry=updated,
+            )
+            self._last_persisted_value_ms = current
+            self._stable_observations = 0  # reset; require fresh stability after a write
+
+        # Persist outside the lock — atomic temp+rename, safe to release first.
+        try:
+            self._cache.save(self._cache_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "calibration_warmup.persist_failed path=%s: %s",
+                self._cache_path, exc,
+            )
+            return False
+        logger.info(
+            "auto-calibrate: persisted latency_compensation_ms=%.1f for "
+            "embodiment=%s model_hash=%s",
+            current, self._embodiment, self._model_hash,
+        )
+        return True
+
+
 __all__ = [
     "SCHEMA_VERSION",
     "DEFAULT_STALE_AFTER_DAYS",
@@ -936,6 +1119,7 @@ __all__ = [
     "MeasurementContext",
     "CalibrationEntry",
     "CalibrationCache",
+    "CalibrationWarmupTracker",
     "GreedyResolver",
     "ResolverInputs",
     "measure_latency_profile",

@@ -1349,6 +1349,44 @@ def create_app(
             )
             server.calibration_cache = None  # type: ignore[attr-defined]
 
+    # Calibration warmup tracker (Day 5): when auto-calibrate is on AND the
+    # cache holds an entry for this (embodiment, model_hash), the tracker
+    # passively learns latency_compensation_ms from real /act traffic and
+    # writes back to the cache once stable. No active probe; cold-start
+    # uses the embodiment default already in the cached entry.
+    server.calibration_warmup = None  # type: ignore[attr-defined]
+    if (
+        auto_calibrate
+        and getattr(server, "calibration_cache", None) is not None
+        and getattr(server, "calibration_cache_path", None)
+    ):
+        try:
+            from reflex.runtime.calibration import (
+                CalibrationWarmupTracker,
+            )
+            _ec = getattr(server, "embodiment_config", None)
+            _emb = getattr(_ec, "embodiment", None) or "custom"
+            _model_id = Path(server.export_dir).name or "unknown"
+            # Day 5 only writes back when an entry already exists (Day 7+ Modal
+            # integration writes the initial entry). For now, defensively
+            # check; if no entry, the tracker is constructed but maybe_persist
+            # will return False until Day 7 fills the entry.
+            server.calibration_warmup = CalibrationWarmupTracker(  # type: ignore[attr-defined]
+                cache=server.calibration_cache,
+                cache_path=server.calibration_cache_path,
+                embodiment=_emb,
+                model_hash=_model_id,
+            )
+            logger.info(
+                "auto-calibrate: warmup tracker armed for embodiment=%s "
+                "model_hash=%s (writes back when 30+ samples + p95 stable)",
+                _emb, _model_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "auto-calibrate: warmup tracker init failed: %s", exc,
+            )
+
     # A2C2 correction hook (Phase 1 a2c2-correction feature). When
     # `a2c2_checkpoint` is provided, the hook loads the head + wires into
     # /act for per-chunk correction with auto-skip semantics. Per
@@ -1921,6 +1959,21 @@ def create_app(
                     _a2c2.record_outcome(latency_ms=_latency_ms, success=_success)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("a2c2_hook.record_outcome_failed: %s", exc)
+
+            # Auto-calibration warmup tracker (Day 5): record real /act
+            # latency + try to persist a stable p95 back to the cache.
+            # No active probe — passively learns latency_compensation_ms.
+            _calib_warmup = getattr(server, "calibration_warmup", None)
+            if _calib_warmup is not None and isinstance(result, dict):
+                try:
+                    _calib_latency_ms = float(result.get("latency_ms", 0.0))
+                    if _calib_latency_ms > 0:
+                        _calib_warmup.record_latency(_calib_latency_ms)
+                        _calib_warmup.maybe_persist()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "calibration_warmup.record_or_persist_failed: %s", exc,
+                    )
 
             return JSONResponse(content=result)
 

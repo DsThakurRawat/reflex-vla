@@ -978,3 +978,189 @@ def test_create_app_accepts_auto_calibrate_kwargs():
     assert sig.parameters["auto_calibrate"].default is False
     assert sig.parameters["calibration_cache_path"].default is None
     assert sig.parameters["calibrate_force"].default is False
+
+
+# ---------------------------------------------------------------------------
+# Day 5 — CalibrationWarmupTracker
+# ---------------------------------------------------------------------------
+
+
+from reflex.runtime.calibration import CalibrationWarmupTracker  # noqa: E402
+
+
+def _mk_tracker(tmp_path, **overrides) -> CalibrationWarmupTracker:
+    cache = CalibrationCache(reflex_version="0.5.0", hardware_fingerprint=_mk_fp())
+    cache.record(embodiment="franka", model_hash="abc", entry=_mk_entry())
+    cache_path = tmp_path / "cache.json"
+    cache.save(cache_path)
+    defaults = dict(
+        cache=cache,
+        cache_path=cache_path,
+        embodiment="franka",
+        model_hash="abc",
+        window_size=50,
+        tolerance_ms=5.0,
+        stable_count_target=3,
+        min_samples_to_persist=10,
+    )
+    defaults.update(overrides)
+    return CalibrationWarmupTracker(**defaults)
+
+
+def test_tracker_rejects_invalid_window_size(tmp_path):
+    with pytest.raises(ValueError, match="window_size"):
+        _mk_tracker(tmp_path, window_size=0)
+
+
+def test_tracker_rejects_negative_tolerance(tmp_path):
+    with pytest.raises(ValueError, match="tolerance_ms"):
+        _mk_tracker(tmp_path, tolerance_ms=-1.0)
+
+
+def test_tracker_rejects_zero_stable_count_target(tmp_path):
+    with pytest.raises(ValueError, match="stable_count_target"):
+        _mk_tracker(tmp_path, stable_count_target=0)
+
+
+def test_tracker_rejects_zero_min_samples_to_persist(tmp_path):
+    with pytest.raises(ValueError, match="min_samples_to_persist"):
+        _mk_tracker(tmp_path, min_samples_to_persist=0)
+
+
+def test_tracker_rejects_empty_embodiment(tmp_path):
+    with pytest.raises(ValueError, match="embodiment"):
+        _mk_tracker(tmp_path, embodiment="")
+
+
+def test_tracker_record_drops_negative_latency(tmp_path):
+    t = _mk_tracker(tmp_path)
+    t.record_latency(-1.0)
+    assert t.sample_count == 0
+
+
+def test_tracker_record_drops_nan_latency(tmp_path):
+    t = _mk_tracker(tmp_path)
+    t.record_latency(float("nan"))
+    assert t.sample_count == 0
+
+
+def test_tracker_record_appends_valid_latency(tmp_path):
+    t = _mk_tracker(tmp_path)
+    t.record_latency(42.0)
+    assert t.sample_count == 1
+
+
+def test_tracker_p95_none_when_under_min_samples(tmp_path):
+    t = _mk_tracker(tmp_path, min_samples_to_persist=10)
+    for v in [40.0, 41.0, 42.0]:
+        t.record_latency(v)
+    assert t.current_p95_ms() is None
+
+
+def test_tracker_p95_returned_when_enough_samples(tmp_path):
+    t = _mk_tracker(tmp_path, min_samples_to_persist=10)
+    for i in range(15):
+        t.record_latency(40.0 + i)
+    p95 = t.current_p95_ms()
+    assert p95 is not None
+    assert 50.0 <= p95 <= 55.0  # roughly the 95th percentile of [40..54]
+
+
+def test_tracker_maybe_persist_returns_false_under_min_samples(tmp_path):
+    t = _mk_tracker(tmp_path, min_samples_to_persist=10)
+    for v in [40.0, 41.0]:
+        t.record_latency(v)
+    assert t.maybe_persist() is False
+
+
+def test_tracker_first_persist_writes_after_min_samples(tmp_path):
+    """Minimum: 10 samples → first persist writes the warmup-derived
+    value immediately (no prior to compare against). Subsequent stability
+    detection avoids re-writing on noise."""
+    t = _mk_tracker(
+        tmp_path, min_samples_to_persist=10, stable_count_target=3,
+        tolerance_ms=5.0,
+    )
+    for _ in range(15):
+        t.record_latency(50.0)  # constant, so p95 is stable
+    # First call with sufficient samples → persist (no last to compare)
+    assert t.maybe_persist() is True
+    assert t.last_persisted_value_ms is not None
+    # Subsequent immediate calls with same stable p95: stable_observations
+    # increments, persist again only after stable_count_target reached
+    assert t.maybe_persist() is False  # stable count = 2
+    assert t.maybe_persist() is False  # stable count = 3
+    # Wait — the implementation persists on the THIRD stable observation
+    # past the first persist. Let me document that behavior:
+    # After first persist: stable_observations is reset to 0.
+    # Each subsequent stable call increments by 1.
+    # On reaching stable_count_target (3), persists again + resets.
+    # So 1st call persists, 2nd→3rd→4th increment, 4th persists.
+
+
+def test_tracker_persist_updates_cache_file(tmp_path):
+    """After persist, the on-disk cache reflects the new latency_comp."""
+    t = _mk_tracker(
+        tmp_path, min_samples_to_persist=10, stable_count_target=3,
+        tolerance_ms=5.0,
+    )
+    for _ in range(15):
+        t.record_latency(75.0)
+    # First persist with sufficient samples → writes immediately
+    persisted = t.maybe_persist()
+    assert persisted is True
+
+    # Re-load from disk and confirm latency_comp updated
+    reloaded = CalibrationCache.load(tmp_path / "cache.json")
+    entry = reloaded.lookup(embodiment="franka", model_hash="abc")
+    assert entry is not None
+    assert abs(entry.latency_compensation_ms - 75.0) < 1.0
+
+
+def test_tracker_unstable_p95_does_not_persist(tmp_path):
+    """When p95 swings outside tolerance_ms, stability counter resets and
+    no write happens until things settle."""
+    t = _mk_tracker(
+        tmp_path, min_samples_to_persist=10, stable_count_target=3,
+        tolerance_ms=5.0,
+    )
+    # Initial stable batch
+    for _ in range(15):
+        t.record_latency(50.0)
+    t.maybe_persist()  # seed last_persisted
+    # Now wildly different latencies — p95 changes outside tolerance
+    for _ in range(15):
+        t.record_latency(150.0)
+    # First call after the swing: outside tolerance → resets counter, no persist
+    assert t.maybe_persist() is False
+
+
+def test_tracker_does_not_persist_when_no_existing_entry(tmp_path):
+    """Day 5 design: warm-up only updates an existing entry. If the
+    resolver hasn't created one yet, persist is a no-op."""
+    cache = CalibrationCache(reflex_version="0.5.0", hardware_fingerprint=_mk_fp())
+    # Note: NOT recording an entry for franka/abc
+    cache_path = tmp_path / "empty_cache.json"
+    cache.save(cache_path)
+    t = CalibrationWarmupTracker(
+        cache=cache,
+        cache_path=cache_path,
+        embodiment="franka",
+        model_hash="abc",  # no matching entry exists
+        min_samples_to_persist=10,
+        stable_count_target=3,
+    )
+    for _ in range(15):
+        t.record_latency(50.0)
+    t.maybe_persist()
+    t.maybe_persist()
+    assert t.maybe_persist() is False  # no entry to update
+
+
+def test_tracker_window_bounded_to_size(tmp_path):
+    """Old samples are evicted as new ones arrive."""
+    t = _mk_tracker(tmp_path, window_size=10, min_samples_to_persist=5)
+    for i in range(50):
+        t.record_latency(40.0 + i * 0.1)
+    assert t.sample_count == 10
+
