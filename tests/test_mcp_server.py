@@ -19,6 +19,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# Optional dep: fastmcp ships behind reflex-vla[mcp]. When not
+# installed, all tests in this file skip rather than error -- the mcp-
+# server feature is correctly gated as an extra. Caught while verifying
+# Track A status 2026-04-25.
+fastmcp = pytest.importorskip("fastmcp")
+
 from reflex.mcp import create_mcp_server
 
 
