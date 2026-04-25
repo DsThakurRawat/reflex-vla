@@ -609,3 +609,243 @@ def test_measure_default_args_runs_clean():
     assert quality.warmup_iters == 10
     assert quality.median_ms >= 0
     assert 0.0 <= quality.quality_score <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# GreedyResolver (Day 3)
+# ---------------------------------------------------------------------------
+
+
+from reflex.runtime.calibration import GreedyResolver, ResolverInputs  # noqa: E402
+
+
+def _mk_inputs(**overrides) -> ResolverInputs:
+    defaults = dict(
+        available_variants=("fp16",),
+        available_providers=(
+            "TensorrtExecutionProvider",
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ),
+        candidate_nfes=(10, 8, 4, 2, 1),
+        hardware=_mk_fp(),
+        embodiment="franka",
+        chunk_size_default=50,
+        control_frequency_hz=20.0,
+        max_batch=1,
+    )
+    defaults.update(overrides)
+    return ResolverInputs(**defaults)
+
+
+def test_resolver_inputs_rejects_empty_variants():
+    with pytest.raises(ValueError, match="available_variants"):
+        _mk_inputs(available_variants=())
+
+
+def test_resolver_inputs_rejects_empty_providers():
+    with pytest.raises(ValueError, match="available_providers"):
+        _mk_inputs(available_providers=())
+
+
+def test_resolver_inputs_rejects_empty_candidate_nfes():
+    with pytest.raises(ValueError, match="candidate_nfes"):
+        _mk_inputs(candidate_nfes=())
+
+
+def test_resolver_inputs_rejects_zero_chunk_size():
+    with pytest.raises(ValueError, match="chunk_size_default"):
+        _mk_inputs(chunk_size_default=0)
+
+
+def test_resolver_inputs_rejects_zero_control_hz():
+    with pytest.raises(ValueError, match="control_frequency_hz"):
+        _mk_inputs(control_frequency_hz=0.0)
+
+
+def test_resolver_inputs_chunk_period_arithmetic():
+    # 50 actions / 20 Hz = 2500ms = 2.5s chunk period
+    inputs = _mk_inputs(chunk_size_default=50, control_frequency_hz=20.0)
+    assert inputs.chunk_period_ms == pytest.approx(2500.0)
+
+
+def test_resolver_inputs_expert_budget_subtracts_safety_margin():
+    """Default safety margin is 30% — expert budget = 70% of chunk period."""
+    inputs = _mk_inputs(chunk_size_default=50, control_frequency_hz=20.0)
+    # 2500ms * 0.7 = 1750ms
+    assert inputs.expert_budget_ms == pytest.approx(1750.0)
+
+
+# Variant resolution
+
+
+def test_resolver_picks_fp16_when_only_one_available():
+    resolver = GreedyResolver(_mk_inputs(available_variants=("fp16",)))
+    assert resolver.resolve_variant() == "fp16"
+
+
+def test_resolver_prefers_fp8_on_hopper():
+    """A100/A10 don't support fp8 — H100 does. Verify the gpu_name match
+    correctly enables fp8 selection."""
+    resolver = GreedyResolver(_mk_inputs(
+        available_variants=("fp8", "int8", "fp16"),
+        hardware=_mk_fp(gpu_name="NVIDIA H100"),
+    ))
+    assert resolver.resolve_variant() == "fp8"
+
+
+def test_resolver_skips_fp8_on_a10g():
+    """A10G is sm_86 — no fp8 hardware support. Should fall through to int8."""
+    resolver = GreedyResolver(_mk_inputs(
+        available_variants=("fp8", "int8", "fp16"),
+        hardware=_mk_fp(gpu_name="NVIDIA A10G"),
+    ))
+    assert resolver.resolve_variant() == "int8"
+
+
+def test_resolver_falls_back_to_fp16_when_int8_missing():
+    resolver = GreedyResolver(_mk_inputs(
+        available_variants=("fp16",),
+        hardware=_mk_fp(gpu_name="NVIDIA A10G"),
+    ))
+    assert resolver.resolve_variant() == "fp16"
+
+
+# Provider resolution
+
+
+def test_resolver_picks_trt_for_fp16_batch1():
+    resolver = GreedyResolver(_mk_inputs(max_batch=1))
+    assert resolver.resolve_provider("fp16") == "TensorrtExecutionProvider"
+
+
+def test_resolver_skips_trt_when_batch_above_one():
+    """Per ADR 2026-04-14-disable-trt-when-batch-gt-1, TRT EP rebuilds
+    engines per batch shape — disabled for batch > 1."""
+    resolver = GreedyResolver(_mk_inputs(max_batch=4))
+    assert resolver.resolve_provider("fp16") == "CUDAExecutionProvider"
+
+
+def test_resolver_skips_trt_for_int8():
+    """TRT EP requires pre-built int8 calibration cache; not shipped Phase 1."""
+    resolver = GreedyResolver(_mk_inputs())
+    assert resolver.resolve_provider("int8") == "CUDAExecutionProvider"
+
+
+def test_resolver_falls_back_to_cpu_when_no_gpu():
+    """CPU-only host: CUDAExecutionProvider not in available list."""
+    resolver = GreedyResolver(_mk_inputs(
+        available_providers=("CPUExecutionProvider",),
+    ))
+    assert resolver.resolve_provider("fp16") == "CPUExecutionProvider"
+
+
+# NFE resolution — the falsifiable claim from the ADR
+
+
+def test_resolver_picks_largest_fitting_nfe():
+    """expert_budget = 1750ms, expert_step = 100ms → 17 fits, NFE=10 picked."""
+    resolver = GreedyResolver(_mk_inputs())  # default budget 1750ms
+    nfe = resolver.resolve_nfe(
+        variant="fp16", provider="CUDAExecutionProvider",
+        expert_denoise_ms_per_step=100.0,
+    )
+    assert nfe == 10
+
+
+def test_resolver_falls_back_to_smaller_nfe_when_step_expensive():
+    """Step is 200ms; budget 1750ms → only NFE up to 8 fits (8 × 200 = 1600).
+    NFE=10 (10 × 200 = 2000 > 1750) excluded."""
+    resolver = GreedyResolver(_mk_inputs())
+    nfe = resolver.resolve_nfe(
+        variant="fp16", provider="CUDAExecutionProvider",
+        expert_denoise_ms_per_step=200.0,
+    )
+    assert nfe == 8
+
+
+def test_resolver_falls_back_to_nfe_one_on_a10g_franka_pi05_teacher():
+    """The falsifiable claim from ADR 2026-04-25-auto-calibration-architecture:
+    A10G × franka (50 chunk @ 20 Hz) × NFE=10 with pi0.5 teacher (~400ms
+    per expert step on A10G) has no legal solution. Resolver falls back to
+    NFE=1 (forces SnapFlow path)."""
+    inputs = _mk_inputs(
+        embodiment="franka", chunk_size_default=50, control_frequency_hz=20.0,
+        hardware=_mk_fp(gpu_name="NVIDIA A10G"),
+    )
+    resolver = GreedyResolver(inputs)
+    # 400ms per step × 1 NFE = 400ms; budget = 1750ms → fits at NFE=4 (1600ms)
+    # but NFE=8 (3200ms) and NFE=10 (4000ms) don't.
+    nfe = resolver.resolve_nfe(
+        variant="fp16", provider="CUDAExecutionProvider",
+        expert_denoise_ms_per_step=400.0,
+    )
+    assert nfe == 4  # largest fitting
+
+    # With a more expensive teacher (1000ms per step), only NFE=1 fits
+    nfe = resolver.resolve_nfe(
+        variant="fp16", provider="CUDAExecutionProvider",
+        expert_denoise_ms_per_step=1000.0,
+    )
+    assert nfe == 1
+
+
+def test_resolver_handles_negative_step_defensively():
+    """Invalid measurement → fall back to smallest NFE without crashing."""
+    resolver = GreedyResolver(_mk_inputs())
+    nfe = resolver.resolve_nfe(
+        variant="fp16", provider="CUDAExecutionProvider",
+        expert_denoise_ms_per_step=-1.0,
+    )
+    assert nfe == 1  # smallest of (10, 8, 4, 2, 1)
+
+
+def test_resolver_returns_smallest_when_no_nfe_fits():
+    """Even NFE=1 exceeds the budget — return smallest with a warning."""
+    resolver = GreedyResolver(_mk_inputs())
+    # Budget = 1750ms; even 1 × 5000ms doesn't fit
+    nfe = resolver.resolve_nfe(
+        variant="fp16", provider="CUDAExecutionProvider",
+        expert_denoise_ms_per_step=5000.0,
+    )
+    assert nfe == 1
+
+
+# Chunk size resolution
+
+
+def test_resolver_returns_default_chunk_size_when_nfe_fits():
+    resolver = GreedyResolver(_mk_inputs(chunk_size_default=50))
+    chunk_size = resolver.resolve_chunk_size(
+        nfe=4, expert_denoise_ms_per_step=100.0,
+    )
+    assert chunk_size == 50
+
+
+def test_resolver_shrinks_chunk_size_when_nfe_too_expensive():
+    """Default chunk_size = 50 → budget 1750ms. NFE=10 × 200ms = 2000ms doesn't
+    fit at chunk=50 — but the resolver only shrinks ONCE (50 → 25). At chunk=25
+    the budget is 875ms — still doesn't fit. Resolver returns 25 with a warning."""
+    resolver = GreedyResolver(_mk_inputs(chunk_size_default=50))
+    chunk_size = resolver.resolve_chunk_size(
+        nfe=10, expert_denoise_ms_per_step=200.0,
+    )
+    assert chunk_size <= 50  # at minimum 25
+
+
+# Latency compensation cold-start
+
+
+def test_resolver_latency_compensation_franka():
+    resolver = GreedyResolver(_mk_inputs(embodiment="franka"))
+    assert resolver.resolve_latency_compensation_ms() == 40.0
+
+
+def test_resolver_latency_compensation_so100():
+    resolver = GreedyResolver(_mk_inputs(embodiment="so100"))
+    assert resolver.resolve_latency_compensation_ms() == 60.0
+
+
+def test_resolver_latency_compensation_unknown_embodiment_uses_default():
+    resolver = GreedyResolver(_mk_inputs(embodiment="custom_robot_xyz"))
+    assert resolver.resolve_latency_compensation_ms() == 40.0  # global default

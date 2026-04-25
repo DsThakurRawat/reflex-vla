@@ -686,6 +686,246 @@ def _quality_score(samples_ms: list[float], median_ms: float) -> float:
     return 1.0 - (cv - _QUALITY_CV_CLEAN) / (_QUALITY_CV_NOISY - _QUALITY_CV_CLEAN)
 
 
+# ---------------------------------------------------------------------------
+# Greedy resolver (Day 3) — strict partial order picker
+# ---------------------------------------------------------------------------
+
+
+# Bounded enum of variants in priority order (most preferred first). Each
+# requires (a) the corresponding .onnx file to be present in the export
+# AND (b) hardware capability (fp8 needs Hopper+; int8 needs a calibration
+# cache from training; fp16 is universal on CUDA).
+_VARIANT_PRIORITY: tuple[str, ...] = ("fp8", "int8", "fp16")
+
+# Bounded enum of ORT providers, in priority order. TRT-EP only when
+# variant is fp16 + max_batch == 1 (per ADR 2026-04-14-disable-trt-when-batch-gt-1).
+_PROVIDER_PRIORITY: tuple[str, ...] = (
+    "TensorrtExecutionProvider",
+    "CUDAExecutionProvider",
+    "CPUExecutionProvider",
+)
+
+# CUDA SM compute capability gates per variant. Hopper = sm_90; sm_89 covers
+# Ada Lovelace (4090, L40). fp8 needs sm_89+ for hardware FP8 support.
+_FP8_MIN_SM = 89
+
+# Candidate NFE values to consider, ordered LARGEST FIRST so the resolver
+# returns the highest NFE that fits the chunk-period budget. 10 is the
+# pi0.5 teacher default; 1 is the SnapFlow-distilled student.
+_DEFAULT_CANDIDATE_NFES: tuple[int, ...] = (10, 8, 4, 2, 1)
+
+# Safety margin: leave at least this fraction of the chunk_period for VLM
+# prefix + RTC overhead. Cuts the budget for the expert denoise loop.
+_CHUNK_PERIOD_SAFETY_MARGIN = 0.30
+
+
+@dataclass(frozen=True)
+class ResolverInputs:
+    """Frozen inputs to GreedyResolver. Built once at calibration time;
+    passes to the resolver verbatim."""
+
+    available_variants: tuple[str, ...]
+    available_providers: tuple[str, ...]
+    candidate_nfes: tuple[int, ...]
+    hardware: "HardwareFingerprint"
+    embodiment: str
+    chunk_size_default: int
+    control_frequency_hz: float
+    max_batch: int = 1  # per ADR, TRT requires == 1
+
+    def __post_init__(self) -> None:
+        if not self.available_variants:
+            raise ValueError("available_variants must be non-empty")
+        if not self.available_providers:
+            raise ValueError("available_providers must be non-empty")
+        if not self.candidate_nfes:
+            raise ValueError("candidate_nfes must be non-empty")
+        if self.chunk_size_default < 1:
+            raise ValueError(
+                f"chunk_size_default must be >= 1, got {self.chunk_size_default}"
+            )
+        if self.control_frequency_hz <= 0:
+            raise ValueError(
+                f"control_frequency_hz must be positive, got "
+                f"{self.control_frequency_hz}"
+            )
+
+    @property
+    def chunk_period_ms(self) -> float:
+        """How long the robot has to consume one chunk (ms). Drives the
+        NFE + chunk_size feasibility math."""
+        return self.chunk_size_default / self.control_frequency_hz * 1000.0
+
+    @property
+    def expert_budget_ms(self) -> float:
+        """Available budget for the expert_denoise loop after carving out
+        VLM prefix + RTC overhead."""
+        return self.chunk_period_ms * (1.0 - _CHUNK_PERIOD_SAFETY_MARGIN)
+
+
+class GreedyResolver:
+    """Resolves calibration parameters in strict partial order.
+
+    Each resolve_* call narrows the search space for the next. Pure
+    functions: same inputs always produce same outputs (no state mutation).
+
+    Usage:
+
+        inputs = ResolverInputs(
+            available_variants=("fp16", "int8"),
+            available_providers=("CUDAExecutionProvider", "CPUExecutionProvider"),
+            candidate_nfes=(10, 8, 4, 2, 1),
+            hardware=HardwareFingerprint.current(),
+            embodiment="franka",
+            chunk_size_default=50,
+            control_frequency_hz=20.0,
+        )
+        resolver = GreedyResolver(inputs)
+        variant = resolver.resolve_variant()
+        provider = resolver.resolve_provider(variant)
+        nfe = resolver.resolve_nfe(variant, provider,
+                                    expert_denoise_ms_per_step=measured_ms)
+        chunk_size = resolver.resolve_chunk_size(nfe, expert_denoise_ms_per_step)
+        latency_comp = resolver.resolve_latency_compensation(...)
+    """
+
+    __slots__ = ("_inputs",)
+
+    def __init__(self, inputs: ResolverInputs):
+        self._inputs = inputs
+
+    @property
+    def inputs(self) -> ResolverInputs:
+        return self._inputs
+
+    def resolve_variant(self) -> str:
+        """Pick the best-supported variant. fp8 only on sm_89+; int8 + fp16
+        broadly supported; fp16 is the universal fallback."""
+        avail = set(self._inputs.available_variants)
+        for v in _VARIANT_PRIORITY:
+            if v not in avail:
+                continue
+            if v == "fp8" and not self._supports_fp8():
+                continue
+            return v
+        # Should be unreachable — fp16 should always be in available_variants
+        # if anything is. Fall back to the first available.
+        return self._inputs.available_variants[0]
+
+    def resolve_provider(self, variant: str) -> str:
+        """TRT-EP for fp16 + batch=1 + TRT in available; CUDA-EP otherwise;
+        CPU only as last resort."""
+        avail = set(self._inputs.available_providers)
+        for p in _PROVIDER_PRIORITY:
+            if p not in avail:
+                continue
+            if p == "TensorrtExecutionProvider":
+                # TRT EP rebuilds engine per batch shape — disabled when
+                # max_batch > 1 per ADR 2026-04-14-disable-trt-when-batch-gt-1.
+                if self._inputs.max_batch > 1:
+                    continue
+                # TRT EP works best with fp16; int8 + fp8 require pre-built
+                # calibration profiles we don't ship in Phase 1.
+                if variant != "fp16":
+                    continue
+            return p
+        # Should be unreachable if CPU is in available_providers.
+        return self._inputs.available_providers[0]
+
+    def resolve_nfe(
+        self,
+        variant: str,
+        provider: str,
+        expert_denoise_ms_per_step: float,
+    ) -> int:
+        """Pick the largest NFE such that nfe * step_ms < expert_budget.
+
+        Falls back to NFE=1 when no candidate fits — forces the SnapFlow-
+        distilled path. This is the falsifiable claim from the ADR:
+        A10G x franka x pi0.5-teacher x NFE=10 has no legal solution at
+        20 Hz replan; resolver must drop NFE."""
+        if expert_denoise_ms_per_step <= 0:
+            # Defensive: invalid measurement -> pick lowest NFE
+            logger.warning(
+                "calibration.resolve_nfe: expert_denoise_ms_per_step=%s "
+                "non-positive; falling back to NFE=1",
+                expert_denoise_ms_per_step,
+            )
+            return min(self._inputs.candidate_nfes)
+        budget_ms = self._inputs.expert_budget_ms
+        candidates_desc = sorted(self._inputs.candidate_nfes, reverse=True)
+        for nfe in candidates_desc:
+            if nfe * expert_denoise_ms_per_step <= budget_ms:
+                return nfe
+        # No candidate fits — pick smallest. Operator should see the warning
+        # in the caller and consider the SnapFlow distill path.
+        smallest = min(candidates_desc)
+        logger.warning(
+            "calibration.resolve_nfe: no NFE fits budget — variant=%s "
+            "provider=%s step_ms=%.2f budget_ms=%.2f. Falling back to NFE=%d. "
+            "Consider re-exporting with SnapFlow distillation for 1-NFE inference.",
+            variant, provider, expert_denoise_ms_per_step, budget_ms, smallest,
+        )
+        return smallest
+
+    def resolve_chunk_size(
+        self,
+        nfe: int,
+        expert_denoise_ms_per_step: float,
+    ) -> int:
+        """Use the embodiment default unless even NFE doesn't fit at that
+        chunk size — then halve until it does (minimum 1)."""
+        chunk_size = self._inputs.chunk_size_default
+        budget_ms = self._inputs.expert_budget_ms
+        if nfe * expert_denoise_ms_per_step <= budget_ms:
+            return chunk_size
+        # Shrink until feasible — but in practice this branch fires only
+        # when resolve_nfe also fell back. Cap at 50% reduction floor 1.
+        min_chunk = max(1, chunk_size // 2)
+        while chunk_size > min_chunk:
+            chunk_size //= 2
+            new_budget = chunk_size / self._inputs.control_frequency_hz * 1000.0 * (1 - _CHUNK_PERIOD_SAFETY_MARGIN)
+            if nfe * expert_denoise_ms_per_step <= new_budget:
+                logger.warning(
+                    "calibration.resolve_chunk_size: shrinking chunk_size "
+                    "%d -> %d to fit NFE=%d at step_ms=%.2f",
+                    self._inputs.chunk_size_default, chunk_size, nfe,
+                    expert_denoise_ms_per_step,
+                )
+                return chunk_size
+        # Even at min_chunk doesn't fit — return min anyway with a loud warning.
+        logger.warning(
+            "calibration.resolve_chunk_size: even chunk_size=%d insufficient "
+            "for NFE=%d at step_ms=%.2f. Customer should re-export with "
+            "SnapFlow distillation OR lower control_frequency_hz.",
+            min_chunk, nfe, expert_denoise_ms_per_step,
+        )
+        return min_chunk
+
+    def resolve_latency_compensation_ms(self) -> float:
+        """Cold-start default by embodiment. Real value populates via the
+        passive LatencyTracker warm-update (Day 5)."""
+        return COLD_START_LATENCY_COMP_MS_BY_EMBODIMENT.get(
+            self._inputs.embodiment, DEFAULT_COLD_START_LATENCY_COMP_MS,
+        )
+
+    # --- internals -------------------------------------------------------
+
+    def _supports_fp8(self) -> bool:
+        """fp8 requires sm_89+ (Ada Lovelace / Hopper / Blackwell). The
+        hardware fingerprint doesn't carry SM compute capability today;
+        approximate via gpu_name string match. Phase 2: probe via cuda
+        runtime API for a precise check."""
+        name = self._inputs.hardware.gpu_name.lower()
+        # sm_89: Ada Lovelace (RTX 4090, L40, L4); sm_90+: Hopper (H100), Blackwell.
+        if any(t in name for t in ("h100", "h200", "b100", "b200", "h800")):
+            return True
+        if any(t in name for t in ("4090", "4080", "4070", "l40", "l4 ")):
+            return True
+        # A100, A10, A40, T4, V100 etc. are all pre-Hopper; no fp8.
+        return False
+
+
 __all__ = [
     "SCHEMA_VERSION",
     "DEFAULT_STALE_AFTER_DAYS",
@@ -696,5 +936,7 @@ __all__ = [
     "MeasurementContext",
     "CalibrationEntry",
     "CalibrationCache",
+    "GreedyResolver",
+    "ResolverInputs",
     "measure_latency_profile",
 ]
