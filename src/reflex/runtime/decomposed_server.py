@@ -239,36 +239,86 @@ class Pi05DecomposedServer:
         logger.info("Pi05DecomposedServer ready")
 
     def _ensure_tokenizer(self) -> None:
-        """Lazy-load the HF tokenizer from the export dir on first use."""
+        """Lazy-load the HF tokenizer from the export dir on first use.
+
+        Fallback chain (per 2026-04-25 b4 gate v4 finding -- distill outputs
+        don't ship a tokenizer + model_id is a local path):
+        1. tokenizer.json sibling in the export dir
+        2. config.model_id when it looks like an HF repo id (org/name)
+        3. distill_provenance.json -> teacher_export when it's an HF id
+        4. paligemma-3b-pt-224 (the canonical VLM tokenizer all pi05 students
+           use; safe default since SnapFlow distill preserves the input
+           tokenization contract from the teacher)
+        """
         if self._tokenizer is not None:
             return
-        try:
-            from transformers import AutoTokenizer
-            # Prefer a tokenizer.json sibling; fall back to the model_id if
-            # the export carries one in reflex_config.
-            tok_dir = self.export_dir
-            if (tok_dir / "tokenizer.json").exists() or (tok_dir / "tokenizer_config.json").exists():
-                self._tokenizer = AutoTokenizer.from_pretrained(str(tok_dir))
-            else:
-                # Fall back to the model_id from the config (if present + HF id).
-                model_id = self.config.get("model_id", "")
-                if model_id and "/" in model_id:
-                    self._tokenizer = AutoTokenizer.from_pretrained(model_id)
-                else:
-                    raise FileNotFoundError(
-                        f"No tokenizer in {self.export_dir} and no HF "
-                        f"model_id in config. Pi05DecomposedServer needs "
-                        f"a tokenizer to encode the instruction."
-                    )
-            logger.info(
-                "Pi05DecomposedServer tokenizer loaded (vocab_size=%d)",
-                self._tokenizer.vocab_size,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Pi05DecomposedServer tokenizer load failed: %s", exc,
-            )
-            raise
+
+        from transformers import AutoTokenizer
+        tried: list[str] = []
+        last_exc: Exception | None = None
+
+        candidates: list[str] = []
+
+        # 1. Sibling tokenizer in the export
+        if (self.export_dir / "tokenizer.json").exists() or (
+            self.export_dir / "tokenizer_config.json"
+        ).exists():
+            candidates.append(str(self.export_dir))
+
+        # 2. config.model_id if it looks like an HF repo id (org/name) and
+        # NOT a local path
+        model_id = self.config.get("model_id", "")
+        if (
+            isinstance(model_id, str)
+            and "/" in model_id
+            and not model_id.startswith("/")
+            and "::" not in model_id
+        ):
+            candidates.append(model_id)
+
+        # 3. distill_provenance.json's teacher_export, if present + HF id
+        prov_path = self.export_dir / "distill_provenance.json"
+        if prov_path.exists():
+            try:
+                prov = json.loads(prov_path.read_text())
+                teacher = prov.get("teacher_export", "")
+                if (
+                    isinstance(teacher, str)
+                    and "/" in teacher
+                    and not teacher.startswith("/")
+                ):
+                    candidates.append(teacher)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 4. Paligemma fallback -- the VLM tokenizer all pi05 students use.
+        # Safe because SnapFlow distill preserves the input contract from
+        # the teacher (which is paligemma-based for pi0/pi05).
+        candidates.append("google/paligemma-3b-pt-224")
+
+        for cand in candidates:
+            try:
+                tok = AutoTokenizer.from_pretrained(cand)
+                self._tokenizer = tok
+                logger.info(
+                    "Pi05DecomposedServer tokenizer loaded from %r "
+                    "(vocab_size=%d)", cand, tok.vocab_size,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                tried.append(cand)
+                last_exc = exc
+                continue
+
+        logger.error(
+            "Pi05DecomposedServer tokenizer load failed; tried %d sources: "
+            "%r. Last error: %s", len(tried), tried, last_exc,
+        )
+        raise RuntimeError(
+            f"No tokenizer found for {self.export_dir}. Tried {len(tried)} "
+            f"sources ({tried!r}). Pi05DecomposedServer needs a tokenizer "
+            f"to encode the instruction. Last error: {last_exc}"
+        )
 
     # -- Server-interface contract -----------------------------------------
 
