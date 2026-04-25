@@ -15,6 +15,42 @@ CLI flags (Day 4+ wiring).
 """
 from __future__ import annotations
 
+from reflex.pro.consent import (
+    ConsentMismatch,
+    ConsentReceipt,
+    ConsentRequired,
+    PIIOptions,
+    ProConsent,
+)
 from reflex.pro.data_collection import ProDataCollector
+from reflex.pro.license import (
+    HardwareFingerprintLite,
+    LicenseCorrupt,
+    LicenseError,
+    LicenseExpired,
+    LicenseHardwareMismatch,
+    LicenseHeartbeatStale,
+    LicenseMissing,
+    ProLicense,
+    issue_dev_license,
+    load_license,
+)
 
-__all__ = ["ProDataCollector"]
+__all__ = [
+    "ConsentMismatch",
+    "ConsentReceipt",
+    "ConsentRequired",
+    "HardwareFingerprintLite",
+    "LicenseCorrupt",
+    "LicenseError",
+    "LicenseExpired",
+    "LicenseHardwareMismatch",
+    "LicenseHeartbeatStale",
+    "LicenseMissing",
+    "PIIOptions",
+    "ProConsent",
+    "ProDataCollector",
+    "ProLicense",
+    "issue_dev_license",
+    "load_license",
+]
