@@ -130,38 +130,43 @@ def _probe_inner(tier: str) -> dict:
     assert quality.n_outliers_dropped >= 0, "n_outliers_dropped must be >= 0"
 
     # Day 7 expansion: validate CalibrationCache round-trip on Modal disk.
-    # Confirms the cache primitive works under the same fingerprint state
-    # the running server would see; surfaces any json-serialization edge
-    # cases that local-only tests can miss.
+    # Real API per src/reflex/runtime/calibration.py (not the names I
+    # guessed earlier; lesson: read the dataclass first).
     print("[calibration] validating CalibrationCache round-trip...")
     cache_path = Path("/tmp/reflex_calibration_smoke.json")
     if cache_path.exists():
         cache_path.unlink()
 
-    # First load -> empty
+    # First load -> empty + stale
     cache_v1 = CalibrationCache.load_or_empty(str(cache_path))
     assert len(cache_v1.entries) == 0, (
         f"fresh cache must be empty, got {len(cache_v1.entries)} entries"
     )
-    # First load is stale (no fingerprint persisted yet)
     assert cache_v1.is_stale(fp), "fresh cache must be stale"
 
-    # Add a synthetic entry
-    ctx = MeasurementContext(
-        knob="latency_compensation_ms",
-        scope_key=f"{tier}-synthetic-stub",
-        runtime_kind="onnx",
-    )
+    # Set hardware fingerprint + record one synthetic entry
+    cache_v1.hardware_fingerprint = fp
+    ctx = MeasurementContext.current()  # probes ort/torch/numpy/onnx versions
     entry = CalibrationEntry(
-        fingerprint=fp,
-        context=ctx,
-        value=float(quality.median_ms),
-        quality=quality,
+        chunk_size=50,
+        nfe=10,
+        latency_compensation_ms=float(quality.median_ms),
+        provider="CPUExecutionProvider",
+        variant=f"{tier}-synthetic-stub",
+        measurement_quality=quality,
+        measurement_context=ctx,
+        timestamp=__import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        ).isoformat(),
     )
-    cache_v1.upsert(entry)
-    cache_v1.persist(str(cache_path))
+    cache_v1.record(
+        embodiment="franka",
+        model_hash="synthetic-stub-1234",
+        entry=entry,
+    )
+    cache_v1.save(str(cache_path))
 
-    # Reopen -> hit (1 entry, fingerprint matches -> not stale)
+    # Reopen -> hit (1 entry; fingerprint matches -> not stale)
     cache_v2 = CalibrationCache.load_or_empty(str(cache_path))
     assert len(cache_v2.entries) == 1, (
         f"reloaded cache should have 1 entry, got {len(cache_v2.entries)}"
@@ -169,7 +174,15 @@ def _probe_inner(tier: str) -> dict:
     assert not cache_v2.is_stale(fp), (
         "reloaded cache with matching fingerprint must NOT be stale"
     )
-    print(f"[calibration]   cache round-trip: persist + reload = {len(cache_v2.entries)} entries (hit)")
+    print(
+        f"[calibration]   cache round-trip: persist + reload = "
+        f"{len(cache_v2.entries)} entries (hit)"
+    )
+
+    # Lookup -> returns the entry
+    looked_up = cache_v2.lookup(embodiment="franka", model_hash="synthetic-stub-1234")
+    assert looked_up is not None, "lookup must return the recorded entry"
+    assert looked_up.chunk_size == 50, "lookup must round-trip the entry exactly"
 
     # is_stale=True when fingerprint differs (simulate driver upgrade)
     fake_fp = HardwareFingerprint(
@@ -184,7 +197,7 @@ def _probe_inner(tier: str) -> dict:
     assert cache_v2.is_stale(fake_fp), (
         "cache must be stale when fingerprint differs (driver bump)"
     )
-    print("[calibration]   cache invalidation: differing fingerprint -> stale ✓")
+    print("[calibration]   cache invalidation: differing fingerprint -> stale OK")
 
     return {
         "status": "ok",
