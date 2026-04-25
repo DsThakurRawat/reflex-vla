@@ -220,6 +220,13 @@ _RESULT_LINE_RE = re.compile(
 _PER_TASK_RE = re.compile(
     r"\[onnx\] task (?P<task_idx>\d+) done: (?P<succ>\d+)/(?P<total>\d+)",
 )
+# Pattern that scripts/modal_libero_monolithic_onnx.py prints when the
+# function early-returns {"status": "fail", "reason": ...}. Per
+# reflex_context experiment 2026-04-25-eval-as-a-service-modal-runner-
+# validation.md action item #1: surface this directly to the operator
+# instead of folding into a generic "no summary marker" message.
+_FAIL_STATUS_RE = re.compile(r"^\s*status:\s*FAIL\s*$", re.MULTILINE)
+_FAIL_REASON_RE = re.compile(r"^\s*reason:\s*(?P<reason>.+)$", re.MULTILINE)
 
 
 def _parse_modal_stdout(stdout: str, *, suite: str) -> dict | None:
@@ -288,6 +295,21 @@ def _parse_invocation_to_episodes(
         )]
 
     if invocation.parsed_result is None:
+        # Check for the explicit fail-status marker first (cleaner
+        # operator message than the generic "no summary" fallback).
+        fail_status = _FAIL_STATUS_RE.search(invocation.stdout or "")
+        if fail_status is not None:
+            reason_match = _FAIL_REASON_RE.search(invocation.stdout or "")
+            reason = (
+                reason_match.group("reason").strip()
+                if reason_match else "(no reason printed)"
+            )
+            return [_failure_row(
+                suite=suite, episode_index=0,
+                error_message=(
+                    f"modal script reported status=FAIL: {reason}"
+                ),
+            )]
         return [_failure_row(
             suite=suite, episode_index=0,
             error_message=(

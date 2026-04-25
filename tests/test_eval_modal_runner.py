@@ -145,6 +145,35 @@ def test_episodes_unparseable_stdout_yields_failure_row():
     assert "did not contain expected summary" in eps[0].error_message
 
 
+def test_episodes_fail_status_marker_surfaces_reason():
+    """Per 2026-04-25 modal smoke validation: when the script prints
+    status: FAIL + reason: ..., wrapper surfaces the reason directly
+    instead of the generic 'no summary marker' fallback."""
+    stdout = (
+        "[onnx] action_dim orig=7 max=32 chunk=50\n"
+        "\n=== RESULT ===\n"
+        "  status: FAIL\n"
+        "  reason: /onnx_out/smolvla_libero_monolithic/model.onnx not found\n"
+        "Stopping app - local entrypoint completed.\n"
+    )
+    invocation = _make_invocation(returncode=0, stdout=stdout, parsed=None)
+    eps = _parse_invocation_to_episodes(invocation)
+    assert len(eps) == 1
+    assert not eps[0].success
+    assert "status=FAIL" in eps[0].error_message
+    assert "model.onnx not found" in eps[0].error_message
+
+
+def test_episodes_fail_status_without_reason_is_handled():
+    """Edge case: status: FAIL printed but reason: line absent."""
+    stdout = "  status: FAIL\n"
+    invocation = _make_invocation(returncode=0, stdout=stdout, parsed=None)
+    eps = _parse_invocation_to_episodes(invocation)
+    assert len(eps) == 1
+    assert "status=FAIL" in eps[0].error_message
+    assert "(no reason printed)" in eps[0].error_message
+
+
 def test_episodes_empty_per_task_yields_failure_row():
     invocation = _make_invocation(parsed={
         "suite": "libero_spatial", "total_success": 0, "total_eps": 0,
