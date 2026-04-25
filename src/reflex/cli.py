@@ -881,16 +881,28 @@ def serve(
     ),
     max_batch: int = typer.Option(
         1,
-        help="Multi-robot batching: serve up to N concurrent /act requests in "
-             "one batched ONNX inference. Default 1 (no batching). "
-             "Throughput-per-GPU scales sublinearly with batch size — typical "
-             "wins are 2-3x at batch=4-8 for transformer-style VLAs.",
+        help="DEPRECATED — superseded by --max-batch-cost-ms in Phase 1 "
+             "chunk-budget-batching. Setting --max-batch > 1 still works "
+             "(legacy fixed-count batching) but emits a one-time deprecation "
+             "warning at startup. Migration: set --max-batch-cost-ms = "
+             "max_batch × per_request_cold_start_ms (e.g., --max-batch 8 "
+             "→ --max-batch-cost-ms 400 at the 50ms cold-start default).",
     ),
     batch_timeout_ms: float = typer.Option(
         5.0,
-        help="With --max-batch > 1, wait up to this many ms after the first "
-             "request before flushing the batch. Lower = lower per-request "
-             "latency; higher = better batching efficiency under bursty load.",
+        help="Maximum wait per batch flush in ms. The PolicyRuntime worker "
+             "flushes when --max-batch-cost-ms is reached OR this timeout "
+             "fires (whichever first). Lower = lower per-request latency; "
+             "higher = better batching efficiency under bursty load.",
+    ),
+    max_batch_cost_ms: float = typer.Option(
+        100.0,
+        "--max-batch-cost-ms",
+        help="Per-policy chunk-budget scheduler: flush a batch when the "
+             "estimated GPU-ms cost reaches this value. Default 100ms — fits "
+             "comfortably under most p99 SLOs; bump higher to favor "
+             "throughput, lower for tail latency. Bounded [10, 500] ms. "
+             "Per ADR 2026-04-24-chunk-budget-batching-architecture.",
     ),
     api_key: str = typer.Option(
         "",
@@ -1322,6 +1334,20 @@ def serve(
         )
         raise typer.Exit(1)
 
+    # chunk-budget-batching CLI validation + --max-batch deprecation
+    if not (10.0 <= max_batch_cost_ms <= 500.0):
+        console.print(
+            f"[red]--max-batch-cost-ms must be in [10, 500], got {max_batch_cost_ms}[/red]"
+        )
+        raise typer.Exit(1)
+    if max_batch > 1:
+        console.print(
+            "[yellow]--max-batch > 1 is DEPRECATED in Phase 1 chunk-budget-"
+            f"batching. Use --max-batch-cost-ms instead. Current value "
+            f"--max-batch={max_batch} is ignored at the runtime layer; "
+            f"PolicyRuntime always uses --max-batch-cost-ms (default 100).[/yellow]"
+        )
+
     # SLO enforcement (Phase 1 latency-slo-enforcement feature).
     # --slo required to enable; default mode is "degrade".
     slo_tracker = None
@@ -1367,6 +1393,7 @@ def serve(
         otel_sample=otel_sample,
         robot_id=robot_id or None,
         cuda_graphs_enabled=cuda_graphs,
+        max_batch_cost_ms=max_batch_cost_ms,
     )
     if api_key:
         composed.append("[cyan]api-key-auth[/cyan]")
@@ -1382,6 +1409,7 @@ def serve(
         composed.append(f"[cyan]robot[/cyan]={robot_id}")
     if cuda_graphs:
         composed.append("[cyan]cuda-graphs[/cyan]")
+    composed.append(f"[cyan]batch-budget[/cyan]={max_batch_cost_ms:g}ms")
     # MCP server integration (Phase 1 mcp-server feature).
     # --mcp --mcp-transport stdio: MCP-only mode (FastAPI NOT started — stdio
     #   needs to own stdin/stdout; used for Claude Desktop / Cursor).

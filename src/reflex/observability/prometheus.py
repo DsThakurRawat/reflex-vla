@@ -352,6 +352,111 @@ def observe_cuda_graph_replay_seconds(embodiment: str, session: str, seconds: fl
 
 
 # ---------------------------------------------------------------------------
+# Chunk-budget batching metrics (Phase 1 chunk-budget-batching feature)
+#
+# Per ADR 2026-04-24-chunk-budget-batching-architecture decision #4:
+# ship `captured_graph_hit_rate` + `batch_cost_per_flush` diagnostic
+# metrics with Phase 1, NOT in a follow-up release. They answer the
+# riskiest-assumption gate ("does the scheduler land batches at
+# captured-graph batch sizes?") and unblock the Phase 2 compile-cache
+# feature's telemetry surface.
+#
+# Cardinality: bounded enums on (embodiment, policy_slot). Phase 1
+# single-policy collapses policy_slot to "prod"; policy-versioning
+# adds {a, b, prod, shadow}. ~3 embodiments × 4 slots = 12 series per
+# metric; well within budget.
+# ---------------------------------------------------------------------------
+
+# Bucket spans the realistic GPU-ms cost range: 10ms (tiny captured-graph
+# replay) → 5000ms (worst-case A10G decomposed cache-miss + multi-NFE).
+_BATCH_COST_BUCKETS = (10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0)
+reflex_batch_cost_per_flush_ms = Histogram(
+    "reflex_batch_cost_per_flush_ms",
+    "Estimated GPU-ms cost of each scheduler-flushed batch",
+    labelnames=("embodiment", "policy_slot"),
+    buckets=_BATCH_COST_BUCKETS,
+    registry=REGISTRY,
+)
+
+# Bucket spans batch sizes 1..32. Phase 1 single-shape decomposed dispatch
+# has size = queue depth at flush; rarely exceeds 4 in practice today
+# (workers drain fast). Future dynamic-shape exports may push this higher.
+_BATCH_SIZE_BUCKETS = (1, 2, 4, 8, 16, 32)
+reflex_batch_size_per_flush = Histogram(
+    "reflex_batch_size_per_flush",
+    "Number of requests in each scheduler-flushed batch",
+    labelnames=("embodiment", "policy_slot"),
+    buckets=_BATCH_SIZE_BUCKETS,
+    registry=REGISTRY,
+)
+
+# Counter for flush reasons — operator wants to see whether the budget
+# (good — scheduler doing its job) or the timeout (bad — load too low to
+# benefit from batching) drives flushes most.
+reflex_batch_flush_total = Counter(
+    "reflex_batch_flush_total",
+    "Cumulative scheduler flushes by reason",
+    labelnames=("embodiment", "policy_slot", "reason"),  # reason: budget_reached | timeout | single_request_over_budget
+    registry=REGISTRY,
+)
+
+# Gauge tracking the rolling captured-graph hit rate (fraction of recent
+# flushes whose batch landed at a shape size the cuda-graphs ADR captures).
+# Phase 1 single-shape: this is effectively shape_homogeneous == True for
+# every flush (everyone has the same shape). Surfaced anyway as a forward
+# affordance — Phase 2 mixed-shape batches make this load-bearing.
+reflex_captured_graph_hit_rate = Gauge(
+    "reflex_captured_graph_hit_rate",
+    "Rolling fraction of flushed batches that hit a captured-graph shape",
+    labelnames=("embodiment", "policy_slot"),
+    registry=REGISTRY,
+)
+
+# Gauge for the runtime queue depth — exposed continuously (set per flush)
+# so operators can graph backlog vs throughput.
+reflex_policy_runtime_queue_depth = Gauge(
+    "reflex_policy_runtime_queue_depth",
+    "Current PolicyRuntime queue depth (pending requests)",
+    labelnames=("embodiment", "policy_slot"),
+    registry=REGISTRY,
+)
+
+
+def observe_batch_flush(
+    embodiment: str,
+    policy_slot: str,
+    reason: str,
+    batch_cost_ms: float,
+    batch_size: int,
+    shape_homogeneous: bool,
+    queue_depth_after: int,
+) -> None:
+    """Record one scheduler-flushed batch. Called from PolicyRuntime worker.
+
+    `shape_homogeneous` drives the captured-graph-hit-rate gauge — Phase 1
+    single-shape always True; Phase 2 mixed-shape detection here.
+    """
+    reflex_batch_cost_per_flush_ms.labels(
+        embodiment=embodiment, policy_slot=policy_slot,
+    ).observe(batch_cost_ms)
+    reflex_batch_size_per_flush.labels(
+        embodiment=embodiment, policy_slot=policy_slot,
+    ).observe(batch_size)
+    reflex_batch_flush_total.labels(
+        embodiment=embodiment, policy_slot=policy_slot, reason=reason,
+    ).inc()
+    # Hit rate is a per-flush 0/1 signal — set the gauge to the latest
+    # value. Customers smooth via Prometheus rate() over a window in
+    # their own dashboards; we don't try to keep a rolling buffer here.
+    reflex_captured_graph_hit_rate.labels(
+        embodiment=embodiment, policy_slot=policy_slot,
+    ).set(1.0 if shape_homogeneous else 0.0)
+    reflex_policy_runtime_queue_depth.labels(
+        embodiment=embodiment, policy_slot=policy_slot,
+    ).set(queue_depth_after)
+
+
+# ---------------------------------------------------------------------------
 # Render
 # ---------------------------------------------------------------------------
 

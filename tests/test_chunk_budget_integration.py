@@ -201,3 +201,37 @@ def test_runtime_stops_cleanly_on_lifespan_exit(tmp_path, monkeypatch):
     # After context exit, lifespan should have stopped the runtime
     assert runtime_ref is not None
     assert runtime_ref.is_running is False
+
+
+def test_metrics_endpoint_includes_batch_diagnostics(tmp_path, monkeypatch):
+    """After /act traffic, /metrics surfaces the chunk-budget-batching
+    diagnostic series (cost histogram, size histogram, flush counter,
+    capture-hit-rate gauge, queue-depth gauge)."""
+    from fastapi.testclient import TestClient
+
+    export_dir = _setup_app(tmp_path, monkeypatch)
+    from reflex.runtime.server import create_app
+
+    app = create_app(str(export_dir), device="cpu")
+    with TestClient(app) as client:
+        # Drive a few /act calls to populate the metrics.
+        for _ in range(3):
+            resp = client.post("/act", json={
+                "image": _tiny_jpeg_b64(),
+                "instruction": "drive metrics",
+                "state": [0.0] * 6,
+            })
+            assert resp.status_code == 200
+
+        metrics_resp = client.get("/metrics")
+        assert metrics_resp.status_code == 200
+        body = metrics_resp.text
+
+        # All five batch-budget metric families should be present.
+        assert "reflex_batch_cost_per_flush_ms" in body
+        assert "reflex_batch_size_per_flush" in body
+        assert "reflex_batch_flush_total" in body
+        assert "reflex_captured_graph_hit_rate" in body
+        assert "reflex_policy_runtime_queue_depth" in body
+        # Phase 1 single-shape: capture-hit-rate gauge should always be 1.0.
+        assert "reflex_captured_graph_hit_rate{" in body

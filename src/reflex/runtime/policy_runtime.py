@@ -35,6 +35,15 @@ from typing import Any, Awaitable, Callable
 
 from reflex.runtime.batching import CostBudgetScheduler, GpuMsCostModel
 
+# Optional metric emission — gated on the [serve] extra. When prometheus_client
+# isn't installed, the runtime still works; metrics just no-op.
+try:
+    from reflex.observability import observe_batch_flush
+    _METRICS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _METRICS_AVAILABLE = False
+    def observe_batch_flush(**kwargs): pass  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 
@@ -353,6 +362,20 @@ class PolicyRuntime:
 
             self._batches_run += 1
             self._requests_processed += len(batch_requests)
+
+            # Emit per-flush diagnostics (chunk-budget-batching ADR decision #4).
+            try:
+                observe_batch_flush(
+                    embodiment=self._embodiment,
+                    policy_slot=self._policy_id,
+                    reason=decision.reason,
+                    batch_cost_ms=decision.batch_cost_ms,
+                    batch_size=decision.size,
+                    shape_homogeneous=decision.shape_homogeneous,
+                    queue_depth_after=len(self._pending),
+                )
+            except Exception as exc:  # noqa: BLE001 — metrics never break the hot path
+                logger.warning("policy_runtime.metric_emit_failed: %s", exc)
 
             logger.debug(
                 "policy_runtime.flushed policy_id=%s reason=%s size=%d cost_est_ms=%.1f "
