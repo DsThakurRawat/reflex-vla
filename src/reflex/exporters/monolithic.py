@@ -1251,6 +1251,56 @@ def export_gr00t_monolithic(
     }
 
 
+def _model_type_from_local_config(model_id: str) -> str | None:
+    """When model_id is a local path, try to read config.json's
+    `model_type` (HF) or `policy_type` (lerobot) field. Returns None
+    when the path doesn't exist OR config.json is absent OR neither
+    field is present.
+
+    Used by export_monolithic as a fallback when the model_id substring
+    doesn't carry the family name (e.g., distill output checkpoint
+    paths). Per 2026-04-25 self-distilling-serve distill smoke
+    (reflex_context/03_experiments/...-distill-smoke.md): the SnapFlow
+    distill output dir was rejected because the substring match failed
+    on the path, even though the checkpoint's config.json had the
+    correct model_type field.
+    """
+    import json
+    from pathlib import Path
+
+    p = Path(model_id)
+    if not p.exists():
+        return None
+
+    config_path = p / "config.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        with config_path.open() as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    # HF transformers convention: 'model_type' field.
+    # lerobot convention: 'policy_type' field (e.g., 'pi05', 'smolvla').
+    raw = cfg.get("model_type") or cfg.get("policy_type")
+    if not isinstance(raw, str):
+        return None
+    raw = raw.lower()
+
+    # Map raw value to our 4-family bounded enum.
+    if "smolvla" in raw:
+        return "smolvla"
+    if "pi05" in raw or "pi_05" in raw or "pi0_5" in raw:
+        return "pi05"
+    if "pi0" in raw or "pi_0" in raw:
+        return "pi0"
+    if "gr00t" in raw or "groot" in raw:
+        return "gr00t"
+    return None
+
+
 def export_monolithic(
     model_id: str,
     output_dir: str | Path,
@@ -1265,6 +1315,13 @@ def export_monolithic(
     Currently supported: smolvla, pi0, pi05, gr00t.
     """
     if model_type is None:
+        # Substring match on model_id first (works for HF ids like
+        # 'lerobot/pi05_libero_finetuned_v044'). Per CLAUDE.md no-band-aid
+        # principle: when the substring path fails for local-checkpoint
+        # paths (e.g., distill output dirs that don't carry the family
+        # name), fall back to reading the checkpoint's config.json.
+        # Caught by 2026-04-25 self-distilling-serve distill smoke
+        # (reflex_context/03_experiments/2026-04-25-self-distilling-serve-distill-smoke.md).
         mid = model_id.lower()
         if "smolvla" in mid:
             model_type = "smolvla"
@@ -1275,10 +1332,16 @@ def export_monolithic(
         elif "gr00t" in mid or "groot" in mid:
             model_type = "gr00t"
         else:
-            raise ValueError(
-                f"Cannot infer model_type from '{model_id}'. "
-                f"Pass model_type='smolvla', 'pi0', 'pi05', or 'gr00t' explicitly."
-            )
+            # Fallback: read config.json from local path if it exists
+            model_type = _model_type_from_local_config(model_id)
+            if model_type is None:
+                raise ValueError(
+                    f"Cannot infer model_type from '{model_id}' "
+                    f"(no family substring matched + no readable "
+                    f"config.json with policy_type). Pass "
+                    f"model_type='smolvla', 'pi0', 'pi05', or 'gr00t' "
+                    f"explicitly."
+                )
 
     if model_type == "smolvla":
         return export_smolvla_monolithic(model_id, output_dir, num_steps=num_steps, target=target)
