@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-04-25T14:46:23.000Z",
+  "generator": "modal_remeasure_calibration_defaults.py",
+  "phase_1_limit": "Only the synthetic-numpy-stub measurement is bundled in Phase 1. Real ONNX-predict measurements per-embodiment require loading a real model -- ~$50+ for the 100-task matrix. Filed as Phase 2 expansion. The bundled stub still gives customers a fingerprint baseline so cache-validity comparison works on first run.",
+  "tiers": [
+    {
+      "tier": "A10G",
+      "fingerprint": {
+        "gpu_uuid": "GPU-ff494fd3-1149-64b6-e7dd-49f4a1502711",
+        "gpu_name": "NVIDIA A10",
+        "driver_version_major": 580,
+        "driver_version_minor": 95,
+        "cuda_version_major": 13,
+        "cuda_version_minor": 0,
+        "kernel_release": "4.4.0",
+        "cpu_count": 17,
+        "ram_gb": 1007,
+        "reflex_version": "0.1.0"
+      },
+      "measurements": [
+        {
+          "embodiment": "synthetic-numpy-stub",
+          "model_hash": "v1",
+          "entry": {
+            "chunk_size": 50,
+            "nfe": 10,
+            "latency_compensation_ms": 0.26027100000014514,
+            "provider": "CPUExecutionProvider",
+            "variant": "synthetic-numpy-stub",
+            "measurement_quality": {
+              "warmup_iters": 20,
+              "measurement_iters": 200,
+              "median_ms": 0.26027100000014514,
+              "p99_ms": 0.26494239000025566,
+              "n_outliers_dropped": 20,
+              "quality_score": 1.0
+            },
+            "measurement_context": {
+              "ort_version": "unknown",
+              "torch_version": "2.11.0",
+              "numpy_version": "2.4.4",
+              "onnx_version": "1.21.0"
+            },
+            "timestamp": "2026-04-25T14:46:06.214799+00:00"
+          }
+        }
+      ]
+    },
+    {
+      "tier": "A100-80GB",
+      "fingerprint": {
+        "gpu_uuid": "GPU-e4d37148-e3a1-b532-245a-081e5498544c",
+        "gpu_name": "NVIDIA A100 80GB PCIe",
+        "driver_version_major": 580,
+        "driver_version_minor": 95,
+        "cuda_version_major": 13,
+        "cuda_version_minor": 0,
+        "kernel_release": "4.4.0",
+        "cpu_count": 17,
+        "ram_gb": 866,
+        "reflex_version": "0.1.0"
+      },
+      "measurements": [
+        {
+          "embodiment": "synthetic-numpy-stub",
+          "model_hash": "v1",
+          "entry": {
+            "chunk_size": 50,
+            "nfe": 10,
+            "latency_compensation_ms": 0.23391700000008342,
+            "provider": "CPUExecutionProvider",
+            "variant": "synthetic-numpy-stub",
+            "measurement_quality": {
+              "warmup_iters": 20,
+              "measurement_iters": 200,
+              "median_ms": 0.23391700000008342,
+              "p99_ms": 0.24653469999934785,
+              "n_outliers_dropped": 20,
+              "quality_score": 1.0
+            },
+            "measurement_context": {
+              "ort_version": "unknown",
+              "torch_version": "2.11.0",
+              "numpy_version": "2.4.4",
+              "onnx_version": "1.21.0"
+            },
+            "timestamp": "2026-04-25T14:46:23.796347+00:00"
+          }
+        }
+      ]
+    }
+  ]
+}
