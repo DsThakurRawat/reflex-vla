@@ -200,16 +200,29 @@ class Pi05DecomposedServer:
 
         # Probe the lang_tokens input shape from the ONNX session to
         # determine the expected sequence length for tokenization.
-        # Pi05DecomposedInference exposes `_expert_session` after init.
+        # Pi05DecomposedInference exposes both `_sess_prefix` (vlm_prefix.onnx)
+        # and `_sess_expert` (expert_denoise.onnx). lang_tokens is an input to
+        # the prefix session; the expert may also have it but with a different
+        # shape. Probe both to find the right value (caught by 2026-04-25
+        # b4 gate v5: 16 default failed against an export expecting 200).
         try:
-            sess = getattr(self._inference, "_expert_session", None)
-            if sess is not None:
+            for sess_attr in ("_sess_prefix", "_sess_expert", "_expert_session"):
+                sess = getattr(self._inference, sess_attr, None)
+                if sess is None:
+                    continue
                 for inp in sess.get_inputs():
                     if inp.name == "lang_tokens":
                         shape = inp.shape
                         if len(shape) >= 2 and isinstance(shape[1], int):
                             self.lang_seq_len = int(shape[1])
+                            logger.info(
+                                "Pi05DecomposedServer lang_seq_len=%d "
+                                "(probed from %s)",
+                                self.lang_seq_len, sess_attr,
+                            )
                             break
+                if self.lang_seq_len != DEFAULT_LANG_SEQ_LEN:
+                    break
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "lang_seq_len probe failed (%s); using default %d",
