@@ -149,6 +149,7 @@ class RecordWriter:
         gzip_output: bool = True,
         notes: str = "",
         reflex_version: str = "",
+        policies: list[dict[str, Any]] | None = None,
     ) -> None:
         self.record_dir = Path(record_dir)
         self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -189,6 +190,12 @@ class RecordWriter:
             "notes": notes,
             "reflex_version": reflex_version,
         }
+        # Day 7 policy-versioning: optional `policies` block in header,
+        # one entry per loaded policy. v1 readers ignore unknown fields,
+        # so this is back-compat-safe (no schema-version bump per ADR
+        # 2026-04-25-policy-versioning-architecture).
+        if policies:
+            self._header_meta["policies"] = list(policies)
         self.image_redaction: ImageRedaction = image_redaction
         self.instruction_redaction = instruction_redaction
         self.sample_rate = sample_rate
@@ -274,6 +281,7 @@ class RecordWriter:
         deadline: dict[str, Any] | None = None,
         rtc: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
+        routing: dict[str, Any] | None = None,
     ) -> int:
         """Emit one request record. Returns the seq assigned to this call.
 
@@ -339,6 +347,12 @@ class RecordWriter:
             record["rtc"] = rtc
         if error is not None:
             record["error"] = error
+        # Day 7 policy-versioning: optional `routing` block (slot, bucket,
+        # routing_key, optional shadow_actions). v1 readers ignore the
+        # unknown field per ADR 2026-04-25-policy-versioning-architecture
+        # decision (additive evolution, no schema_version bump).
+        if routing is not None:
+            record["routing"] = routing
 
         self._emit(record)
         return seq

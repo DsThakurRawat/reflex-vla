@@ -47,7 +47,10 @@ _LATENCY_BUCKETS = (
 reflex_act_latency_seconds = Histogram(
     "reflex_act_latency_seconds",
     "End-to-end /act handler wall-clock latency",
-    labelnames=("embodiment", "model_id"),
+    # policy_slot bounded enum: "prod" (single-policy) | "a" | "b" (2-policy mode).
+    # Default "prod" preserves series meaning under single-policy deployments.
+    # Cardinality: 3 embodiments × 6 models × 3 slots = 54 series (within 10K budget).
+    labelnames=("embodiment", "model_id", "policy_slot"),
     buckets=_LATENCY_BUCKETS,
     registry=REGISTRY,
 )
@@ -71,21 +74,21 @@ reflex_onnx_load_time_seconds = Histogram(
 reflex_cache_hit_total = Counter(
     "reflex_cache_hit_total",
     "Cache hits, partitioned by cache type",
-    labelnames=("embodiment", "cache_type"),  # action_chunk | vlm_prefix
+    labelnames=("embodiment", "cache_type", "policy_slot"),  # action_chunk | vlm_prefix
     registry=REGISTRY,
 )
 
 reflex_cache_miss_total = Counter(
     "reflex_cache_miss_total",
     "Cache misses, partitioned by cache type",
-    labelnames=("embodiment", "cache_type"),
+    labelnames=("embodiment", "cache_type", "policy_slot"),
     registry=REGISTRY,
 )
 
 reflex_denoise_steps_total = Counter(
     "reflex_denoise_steps_total",
     "Total denoise iterations executed (sum across all /act calls)",
-    labelnames=("embodiment",),
+    labelnames=("embodiment", "policy_slot"),
     registry=REGISTRY,
 )
 
@@ -125,7 +128,7 @@ reflex_model_swaps_total = Counter(
 reflex_in_flight_requests = Gauge(
     "reflex_in_flight_requests",
     "/act requests currently being processed",
-    labelnames=("embodiment",),
+    labelnames=("embodiment", "policy_slot"),
     registry=REGISTRY,
 )
 
@@ -159,9 +162,12 @@ reflex_robot_info = Gauge(
 # ---------------------------------------------------------------------------
 
 
-def record_act_latency(seconds: float, embodiment: str, model_id: str) -> None:
+def record_act_latency(
+    seconds: float, embodiment: str, model_id: str,
+    policy_slot: str = "prod",
+) -> None:
     reflex_act_latency_seconds.labels(
-        embodiment=embodiment, model_id=model_id
+        embodiment=embodiment, model_id=model_id, policy_slot=policy_slot,
     ).observe(seconds)
 
 
@@ -169,20 +175,28 @@ def observe_onnx_load_time(seconds: float, model_id: str) -> None:
     reflex_onnx_load_time_seconds.labels(model_id=model_id).observe(seconds)
 
 
-def inc_cache_hit(embodiment: str, cache_type: str) -> None:
+def inc_cache_hit(
+    embodiment: str, cache_type: str, policy_slot: str = "prod",
+) -> None:
     reflex_cache_hit_total.labels(
-        embodiment=embodiment, cache_type=cache_type
+        embodiment=embodiment, cache_type=cache_type, policy_slot=policy_slot,
     ).inc()
 
 
-def inc_cache_miss(embodiment: str, cache_type: str) -> None:
+def inc_cache_miss(
+    embodiment: str, cache_type: str, policy_slot: str = "prod",
+) -> None:
     reflex_cache_miss_total.labels(
-        embodiment=embodiment, cache_type=cache_type
+        embodiment=embodiment, cache_type=cache_type, policy_slot=policy_slot,
     ).inc()
 
 
-def inc_denoise_steps(embodiment: str, n_steps: int = 1) -> None:
-    reflex_denoise_steps_total.labels(embodiment=embodiment).inc(n_steps)
+def inc_denoise_steps(
+    embodiment: str, n_steps: int = 1, policy_slot: str = "prod",
+) -> None:
+    reflex_denoise_steps_total.labels(
+        embodiment=embodiment, policy_slot=policy_slot,
+    ).inc(n_steps)
 
 
 def inc_safety_violation(embodiment: str, kind: str) -> None:
@@ -230,18 +244,25 @@ def set_episodes_active(embodiment: str, value: int) -> None:
 
 
 @contextmanager
-def track_in_flight(embodiment: str) -> Iterator[None]:
+def track_in_flight(embodiment: str, policy_slot: str = "prod") -> Iterator[None]:
     """Context manager increments/decrements in-flight gauge for safe
     try/finally semantics. Use:
 
         with track_in_flight(embodiment="franka"):
             result = await predict(...)
+
+    policy_slot defaults to "prod" for single-policy mode; 2-policy mode
+    callers pass the slot the request was routed to.
     """
-    reflex_in_flight_requests.labels(embodiment=embodiment).inc()
+    reflex_in_flight_requests.labels(
+        embodiment=embodiment, policy_slot=policy_slot,
+    ).inc()
     try:
         yield
     finally:
-        reflex_in_flight_requests.labels(embodiment=embodiment).dec()
+        reflex_in_flight_requests.labels(
+            embodiment=embodiment, policy_slot=policy_slot,
+        ).dec()
 
 
 # ---------------------------------------------------------------------------
