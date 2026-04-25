@@ -76,17 +76,21 @@ onnx_output = modal.Volume.from_name("pi0-onnx-outputs", create_if_missing=True)
 gate_output = modal.Volume.from_name("a2c2-gate-output", create_if_missing=True)
 
 
-# Same image as modal_libero_via_reflex_serve.py
+# Mirror modal_libero_via_reflex_serve.py exactly so we share the cached image.
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install(
-        "git", "build-essential", "cmake", "libosmesa6-dev",
-        "libgl1-mesa-glx", "libglew-dev", "libglfw3", "libegl1",
-        "libgles2-mesa", "libglib2.0-0",
+        "git", "libgl1-mesa-glx", "libglib2.0-0", "libegl1-mesa",
+        "libglvnd0", "ffmpeg", "cmake", "build-essential",
+        "libosmesa6", "libosmesa6-dev", "clang",
     )
     .pip_install(
-        "numpy", "torch", "Pillow", "matplotlib", "robosuite==1.4.0",
-        "mujoco==2.3.7", "easydict",
+        "torch", "safetensors>=0.4.0", "huggingface_hub",
+        "transformers<5.4,>=4.40", "numpy", "Pillow", "pydantic>=2.0",
+        "pyyaml", "onnx>=1.16", "onnxruntime-gpu>=1.20",
+        "onnxscript>=0.1", "mujoco==3.3.2", "robosuite==1.4.1", "h5py",
+        "bddl==1.0.1", "future", "robomimic", "hydra-core>=1.1",
+        "easydict", "einops", "opencv-python-headless",
         "gym", "gymnasium", "lerobot==0.5.1", "num2words", "imageio",
         "httpx>=0.24",
     )
