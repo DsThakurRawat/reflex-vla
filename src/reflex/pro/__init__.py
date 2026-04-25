@@ -56,6 +56,15 @@ from reflex.pro.rollback import (
     RollbackHandler,
     RollbackOutcome,
 )
+from reflex.pro.weekly_report import (
+    RollbackEntry,
+    TaskDelta,
+    WeeklyReport,
+    render_cli,
+    render_json,
+    send_email,
+    send_slack,
+)
 from reflex.pro.license import (
     HardwareFingerprintLite,
     LicenseCorrupt,
@@ -102,11 +111,18 @@ __all__ = [
     "ProConsent",
     "ProDataCollector",
     "ProLicense",
+    "RollbackEntry",
     "RollbackHandler",
     "RollbackOutcome",
     "SchedulerConfig",
     "SchedulerState",
+    "TaskDelta",
     "TripDecision",
+    "WeeklyReport",
     "issue_dev_license",
     "load_license",
+    "render_cli",
+    "render_json",
+    "send_email",
+    "send_slack",
 ]
