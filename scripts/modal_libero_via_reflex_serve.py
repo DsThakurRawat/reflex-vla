@@ -30,7 +30,7 @@ validate when fired.
 Usage (when ready to fire):
     modal run scripts/modal_libero_via_reflex_serve.py
     modal run scripts/modal_libero_via_reflex_serve.py --num-episodes 3 --tasks 0
-    modal run scripts/modal_libero_via_reflex_serve.py --a2c2-checkpoint /a2c2/head.pt
+    modal run scripts/modal_libero_via_reflex_serve.py --a2c2-checkpoint /a2c2/head.npz
 """
 from __future__ import annotations
 
@@ -166,8 +166,8 @@ def libero_via_serve(
         num_episodes: episodes per task (default 1 for smoke; 50 for full).
         task_suite_name: libero_10 | libero_spatial | libero_object | libero_goal | libero_90.
         task_indices: list of task ids; None = all tasks in suite.
-        a2c2_checkpoint: path to A2C2 head .pt (e.g.,
-            /gate_out/run_001/a2c2_head.pt). Empty = baseline (no A2C2).
+        a2c2_checkpoint: path to A2C2 head .npz (e.g.,
+            /gate_out/run_001/a2c2_head.npz). Empty = baseline (no A2C2).
         seed: RNG seed.
         serve_health_timeout_s: how long to wait for reflex serve /health.
         serve_port: port for the reflex serve subprocess.
@@ -434,7 +434,7 @@ def main(
     --tasks "0"          single task
     --tasks "0,1,2"      3 tasks
     --tasks "all"        full suite
-    --a2c2-checkpoint /gate_out/.../a2c2_head.pt   enable A2C2
+    --a2c2-checkpoint /gate_out/.../a2c2_head.npz  enable A2C2
     """
     if tasks == "all":
         task_list = None

@@ -1,13 +1,15 @@
 """Fire the B.4 A2C2 transfer-validation gate.
 
-Reads a trained A2C2 checkpoint + an in-distribution held-out JSONL split + N
-out-of-distribution JSONL traces (e.g., recorded with `reflex serve
+Reads a trained A2C2 checkpoint (.npz) + an in-distribution held-out JSONL split
++ N out-of-distribution JSONL traces (e.g., recorded with `reflex serve
 --inject-latency-ms 100`). Computes per-trace MSE + the success-delta gate.
 Emits a Markdown + JSON report and exits 0 on PROCEED, 1 on PAUSE, 2 on ABORT.
 
+Path A unification 2026-04-25: pure-numpy now (no torch). Loads .npz directly.
+
 Usage (synthetic plumbing-test, no Modal):
     python scripts/validate_a2c2_transfer.py \\
-        --checkpoint outputs/a2c2_synthetic.pt \\
+        --checkpoint outputs/a2c2_synthetic.npz \\
         --in-dist synthetic:200 \\
         --held-out synthetic:50:30 synthetic:50:60 synthetic:50:120 \\
         --task-success-on 0.94 --task-success-off 0.87 \\
@@ -16,7 +18,7 @@ Usage (synthetic plumbing-test, no Modal):
 
 Usage (real data):
     python scripts/validate_a2c2_transfer.py \\
-        --checkpoint outputs/a2c2_lerobot_trained.pt \\
+        --checkpoint outputs/a2c2_lerobot_trained.npz \\
         --in-dist 'data/libero_held_out/*.jsonl' \\
         --held-out 'data/jetson_traces_1/*.jsonl' \\
                    'data/jetson_traces_2/*.jsonl' \\
@@ -24,11 +26,6 @@ Usage (real data):
         --task-success-on 0.94 --task-success-off 0.87 \\
         --eval-latency-ms 80 \\
         --report outputs/a2c2_transfer_report.md
-
-The synthetic mode exists so the gate harness is exercisable end-to-end without
-real data — useful for CI plumbing checks. Synthetic eval ratios will be ~1.0
-because the head was trained on the same distribution; the success-delta
-threshold is what actually drives the decision.
 """
 from __future__ import annotations
 
@@ -39,6 +36,13 @@ import sys
 from pathlib import Path
 
 import numpy as np
+
+from reflex.correction import (
+    A2C2Head,
+    GateThresholds,
+    compute_gate_report,
+    evaluate_mse,
+)
 
 logger = logging.getLogger("a2c2.validate")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -88,7 +92,9 @@ def _flatten_for_eval(records: list[dict], action_dim: int, obs_dim: int) -> tup
         observed_latency = latency_ms + injected
         for chunk_idx, action in enumerate(actions):
             a = np.asarray(action, dtype=np.float32)
-            if a.shape[0] != action_dim:
+            if a.shape[0] >= action_dim:
+                a = a[:action_dim]
+            else:
                 continue
             obs_pad = np.zeros(obs_dim, dtype=np.float32)
             s = np.asarray(state[:obs_dim], dtype=np.float32)
@@ -141,36 +147,9 @@ def _synthetic_split(
     return base, obs, chunk_idx, latency, target_residual
 
 
-def _compute_mse(head, base, obs, chunk_idx, latency, target_residual, cfg, batch_size: int = 256) -> float:
-    """MSE(predicted_correction, target_residual). Matches training loss exactly.
-
-    For real data, target_residual is zeros -> measures correction magnitude
-    (proxy for transfer noise). For synthetic data, target_residual is the
-    structured noise used at training time -> sharper gate signal.
-    """
-    import torch
-    from reflex.correction.a2c2_head import build_a2c2_input
-    head.eval()
-    n = base.shape[0]
-    if n == 0:
-        return float("nan")
-    sq = 0.0
-    cnt = 0
-    with torch.no_grad():
-        for s in range(0, n, batch_size):
-            e = min(s + batch_size, n)
-            x = build_a2c2_input(base[s:e], obs[s:e], chunk_idx[s:e], latency[s:e], cfg)
-            x_t = torch.from_numpy(x).float()
-            pred = head(x_t).cpu().numpy()
-            err = pred - target_residual[s:e]
-            sq += float(np.sum(err * err))
-            cnt += err.size
-    return sq / max(cnt, 1)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fire B.4 A2C2 transfer gate.")
-    parser.add_argument("--checkpoint", required=True, help="Trained .pt from scripts/train_a2c2.py")
+    parser.add_argument("--checkpoint", required=True, help="Trained .npz from scripts/train_a2c2.py")
     parser.add_argument("--in-dist", required=True, help="JSONL spec OR 'synthetic:N[:LAT]'")
     parser.add_argument("--held-out", nargs="+", required=True,
                         help="One or more JSONL specs (each becomes one trace; "
@@ -192,28 +171,14 @@ def main() -> int:
                         help="Add a note line to the report (repeatable)")
     args = parser.parse_args()
 
-    try:
-        import torch
-    except ImportError:
-        logger.error("torch is required; install reflex-vla[correction]")
-        return 2
-
-    from reflex.correction.a2c2_head import A2C2Config, A2C2Head
-    from reflex.correction.transfer_gate import GateThresholds, compute_gate_report
-
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    train_cfg = ckpt.get("config", {})
-    cfg = A2C2Config(
-        action_dim=int(train_cfg.get("action_dim", 7)),
-        obs_dim=int(train_cfg.get("obs_dim", 256)),
-        chunk_pos_dim=int(train_cfg.get("chunk_pos_dim", 32)),
-        latency_dim=int(train_cfg.get("latency_dim", 32)),
-        hidden_dims=tuple(int(x) for x in str(train_cfg.get("hidden_dims", "128,96")).split(",") if x),
+    head = A2C2Head.from_checkpoint(args.checkpoint)
+    cfg = head.config
+    n_params = sum(w.size + b.size for w, b in zip(head._weights, head._biases))
+    logger.info(
+        "loaded checkpoint: %s (%d params, ~%.1f KB FP32)",
+        args.checkpoint, n_params,
+        cfg.estimated_size_bytes() / 1024,
     )
-    head = A2C2Head(cfg)
-    head.load_state_dict(ckpt["state_dict"])
-    logger.info("loaded checkpoint: %s (%d params, ~%.1f KB FP16)",
-                args.checkpoint, head.param_count(), head.size_bytes() / 1024)
 
     def _load_split(spec: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if spec.startswith("synthetic:"):
@@ -227,13 +192,23 @@ def main() -> int:
         return _flatten_for_eval(recs, cfg.action_dim, cfg.obs_dim)
 
     in_b, in_o, in_c, in_l, in_t = _load_split(args.in_dist)
-    in_dist_mse = _compute_mse(head, in_b, in_o, in_c, in_l, in_t, cfg)
+    in_dist_mse = evaluate_mse(
+        head,
+        base_actions=in_b, observations=in_o,
+        chunk_positions=in_c, latency_ms_per_step=in_l,
+        target_residuals=in_t,
+    )
     logger.info("in-distribution MSE: %.6f (n=%d)", in_dist_mse, in_b.shape[0])
 
     held_out_mses: list[float] = []
     for spec in args.held_out:
         b, o, c, l, t = _load_split(spec)
-        mse = _compute_mse(head, b, o, c, l, t, cfg)
+        mse = evaluate_mse(
+            head,
+            base_actions=b, observations=o,
+            chunk_positions=c, latency_ms_per_step=l,
+            target_residuals=t,
+        )
         logger.info("held-out '%s' MSE: %.6f (n=%d)", spec, mse, b.shape[0])
         held_out_mses.append(mse)
 

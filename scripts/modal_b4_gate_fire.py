@@ -240,14 +240,19 @@ def fire_gate(
                 "report_md": "", "report_json": ""}
 
     # ---- 3. Train A2C2 head on low-latency traces ---------------------------
-    import torch
-    import torch.nn as nn
-    from reflex.correction.a2c2_head import A2C2Config, A2C2Head, build_a2c2_input
+    # Path A unification (2026-04-25): pure-numpy trainer; produces .npz that
+    # runtime/a2c2_hook.py loads directly. No torch on this path.
+    from reflex.correction import (
+        A2C2Config, train_a2c2_head, evaluate_mse,
+    )
 
-    cfg = A2C2Config(action_dim=action_dim, obs_dim=obs_dim, chunk_pos_dim=32, latency_dim=32)
-    head = A2C2Head(cfg)
-    print(f"\nA2C2Head: input={cfg.input_dim} hidden={cfg.hidden_dims} "
-          f"output={cfg.action_dim} params={head.param_count()} (~{head.size_bytes()/1024:.1f} KB FP16)")
+    cfg = A2C2Config(
+        action_dim=action_dim, obs_dim=obs_dim,
+        chunk_size=50, hidden_dim=128, num_hidden_layers=3,
+        position_encoding_dim=32,
+    )
+    print(f"\nA2C2Config: input={cfg.input_dim} hidden={cfg.hidden_dim} × {cfg.num_hidden_layers} "
+          f"output={cfg.action_dim} (~{cfg.estimated_size_bytes()/1024:.1f} KB FP32)")
 
     def _flatten(records: list) -> tuple:
         base_rows, obs_rows, chunk_idx_rows, latency_rows = [], [], [], []
@@ -323,80 +328,63 @@ def fire_gate(
 
     print(f"\ntrain rows (low): {base_l.shape[0]}; held-out rows (high): {base_h.shape[0]}")
 
-    rng_split = np.random.default_rng(42)
-    n_low = base_l.shape[0]
-    perm = rng_split.permutation(n_low)
-    n_val = max(1, int(n_low * 0.1))
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
-
-    optimizer = torch.optim.Adam(head.parameters(), lr=1e-3)
-    loss_fn = nn.MSELoss()
-
-    def _build_batch(idx: np.ndarray, target_residual: np.ndarray) -> tuple:
-        x = build_a2c2_input(base_l[idx], obs_l[idx], ci_l[idx], lat_l[idx], cfg)
-        x_t = torch.from_numpy(x).float()
-        y_t = torch.from_numpy(target_residual[idx]).float()
-        return x_t, y_t
-
     target_residual_l = np.zeros_like(base_l)  # magnitude-proxy; ADR documents
 
-    print("\ntraining A2C2 head:")
-    for epoch in range(train_epochs):
-        head.train()
-        rng_split.shuffle(train_idx)
-        train_losses = []
-        for s in range(0, train_idx.shape[0], train_batch_size):
-            batch = train_idx[s : s + train_batch_size]
-            x_t, y_t = _build_batch(batch, target_residual_l)
-            pred = head(x_t)
-            loss = loss_fn(pred, y_t)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-        head.eval()
-        with torch.no_grad():
-            x_v, y_v = _build_batch(val_idx, target_residual_l)
-            val_loss = float(loss_fn(head(x_v), y_v).item())
-        train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
-        print(f"  epoch {epoch} train={train_loss:.6f} val={val_loss:.6f}")
+    print("\ntraining A2C2 head (numpy + Adam):")
+    train_result = train_a2c2_head(
+        base_actions=base_l,
+        observations=obs_l,
+        chunk_positions=ci_l,
+        latency_ms_per_step=lat_l,
+        target_residuals=target_residual_l,
+        cfg=cfg,
+        epochs=train_epochs,
+        batch_size=train_batch_size,
+        lr=1e-3,
+        val_split=0.1,
+        seed=42,
+    )
+    head = train_result.head
+    for em in train_result.metrics["epochs"]:
+        print(f"  epoch {em['epoch']} train={em['train_loss']:.6f} val={em['val_loss']:.6f}")
 
-    head_path = out_root / "a2c2_head.pt"
-    torch.save({"state_dict": head.state_dict(), "cfg": cfg.__dict__}, head_path)
-    print(f"checkpoint saved: {head_path} ({head_path.stat().st_size / 1024:.1f} KB)")
+    # Path A unification: emit .npz directly (loadable by runtime/a2c2_hook.py)
+    head_path = out_root / "a2c2_head.npz"
+    head.save(head_path)
+    n_params = sum(w.size + b.size for w, b in zip(head._weights, head._biases))
+    print(f"checkpoint saved: {head_path} ({head_path.stat().st_size / 1024:.1f} KB, {n_params} params)")
 
     # ---- 4. Fire gate -------------------------------------------------------
     from reflex.correction.transfer_gate import GateThresholds, compute_gate_report
 
-    def _compute_mse_for(base, obs, ci, lat) -> float:
-        head.eval()
-        n = base.shape[0]
-        if n == 0:
-            return float("nan")
-        sq, cnt = 0.0, 0
-        with torch.no_grad():
-            for s in range(0, n, 256):
-                e = min(s + 256, n)
-                x = build_a2c2_input(base[s:e], obs[s:e], ci[s:e], lat[s:e], cfg)
-                pred = head(torch.from_numpy(x).float()).cpu().numpy()
-                sq += float(np.sum(pred * pred))  # vs zero target
-                cnt += pred.size
-        return sq / max(cnt, 1)
-
-    in_dist_mse = _compute_mse_for(base_l[val_idx], obs_l[val_idx], ci_l[val_idx], lat_l[val_idx])
-    held_out_mse = _compute_mse_for(base_h, obs_h, ci_h, lat_h)
+    # Evaluate against zero-target (magnitude-of-correction proxy on real data).
+    in_dist_mse = evaluate_mse(
+        head,
+        base_actions=base_l, observations=obs_l,
+        chunk_positions=ci_l, latency_ms_per_step=lat_l,
+        target_residuals=target_residual_l,
+    )
+    held_out_mse = evaluate_mse(
+        head,
+        base_actions=base_h, observations=obs_h,
+        chunk_positions=ci_h, latency_ms_per_step=lat_h,
+        target_residuals=np.zeros_like(base_h),
+    )
     print(f"\nin-distribution MSE (low, val split):  {in_dist_mse:.6f}")
     print(f"held-out MSE (high latency):           {held_out_mse:.6f}")
     print(f"ratio: {held_out_mse / max(in_dist_mse, 1e-12):.3f}")
 
+    n_train_rows = base_l.shape[0] - max(1, int(base_l.shape[0] * 0.1))
+    n_val_rows = max(1, int(base_l.shape[0] * 0.1))
     notes = [
         f"B.4 MSE-arm fire on Modal A10G; reflex-vla SHA={_HEAD}",
         f"low={low_latency_ms}ms vs high={high_latency_ms}ms",
-        f"head: action_dim={action_dim} obs_dim={obs_dim} params={head.param_count()}",
-        f"train rows={train_idx.shape[0]} val rows={val_idx.shape[0]} held-out rows={base_h.shape[0]}",
+        f"head: action_dim={action_dim} obs_dim={obs_dim} params={n_params}",
+        f"train rows={n_train_rows} val rows={n_val_rows} held-out rows={base_h.shape[0]}",
         f"export: {export_dir}",
         "task-success arm DEFERRED — requires B.5 minimal /act wiring + LIBERO eval",
         "MSE is magnitude proxy on real data (per ADR 2026-04-24-a2c2-gate-modal-synthetic-latency)",
+        "trainer: numpy + Adam (Path A unification 2026-04-25 — single A2C2Head shared with serve runtime)",
     ]
     report = compute_gate_report(
         in_dist_mse=in_dist_mse,

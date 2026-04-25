@@ -7,20 +7,20 @@ estimated inference delay. Composes with RTC (boundary smoothing) — A2C2 corre
 
 Paper: arxiv 2509.23224 — Sendai, Alvarez, Matsushima, Matsuo, Iwasawa.
 
-Phase B.4 (this module): transfer-validation gate harness. Train on offline LeRobot
-LIBERO traces; eval on synthetic-latency-injected serve traces; emit gate report
-(MSE ratio + task-success delta vs A2C2-off). Acceptance: MSE ratio <= 1.2x AND
-task-success delta >= +5 pp. Hard-abort if ratio > 2.0x OR delta < 0 pp.
+Phase B.4 (gate harness) and Phase B.5 (runtime hook) both use the same
+A2C2Head class from `reflex.kernels.a2c2_correction` (numpy, .npz). The
+training functions live here in `reflex.correction.a2c2_training` (numpy
+backprop + Adam — no torch dependency).
 
-Phase B.5 (deferred to next ship): wire trained head into /act handler.
+Path A unification 2026-04-25: prior PyTorch A2C2Head was dropped; trainers
+and runtime now share one architecture + one checkpoint format.
 """
 
-from reflex.correction.a2c2_head import (
-    A2C2Config,
-    A2C2Head,
-    build_a2c2_input,
-    chunk_pos_encoding,
-    latency_log_encoding,
+from reflex.correction.a2c2_training import (
+    A2C2TrainResult,
+    build_a2c2_input_batch,
+    evaluate_mse,
+    train_a2c2_head,
 )
 from reflex.correction.transfer_gate import (
     GateDecision,
@@ -28,13 +28,20 @@ from reflex.correction.transfer_gate import (
     GateThresholds,
     compute_gate_report,
 )
+from reflex.kernels.a2c2_correction import (
+    A2C2Config,
+    A2C2Head,
+    positional_encoding,
+)
 
 __all__ = [
     "A2C2Config",
     "A2C2Head",
-    "build_a2c2_input",
-    "chunk_pos_encoding",
-    "latency_log_encoding",
+    "A2C2TrainResult",
+    "build_a2c2_input_batch",
+    "evaluate_mse",
+    "positional_encoding",
+    "train_a2c2_head",
     "GateDecision",
     "GateReport",
     "GateThresholds",
