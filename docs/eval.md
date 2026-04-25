@@ -200,7 +200,14 @@ Drop `--num-episodes` or use fewer `--tasks`. The guardrail is conservative; if 
 
 ### `All episodes returned adapter_error` (exit 5)
 
-You're hitting the Phase 1 stub task runner. The Modal subprocess wrapper wires Day 4 of the build plan; see `features/01_serve/subfeatures/_dx_gaps/eval-as-a-service/eval-as-a-service_plan.md`. Until then, use `--cost-preview` for no-run cost estimates.
+Either:
+- The Modal subprocess crashed mid-run — check `report.json` for the `error_message` on the per-episode rows. The first ~500 chars of `modal run` stderr are surfaced there.
+- You're on `--runtime local` (the local runner is Phase 1 follow-up; use `--runtime modal` for now).
+- The Modal `run_libero_*` script's stdout format changed — the parser pins on `====== <suite> (ONNX monolithic) ======` headers. File a bug if the script was bumped.
+
+### `modal CLI not found on PATH` (exit 6)
+
+Install via `pip install modal` then run `modal token new` to authenticate. `--runtime modal` cannot proceed without it; we never silently fall back to `--runtime local` (would mask real config issues + cost surprises).
 
 ## Pricing
 

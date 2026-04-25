@@ -865,7 +865,11 @@ def eval_cmd(
     )
     from reflex.eval.preflight import PreflightSmokeTest
     from reflex.eval.report import build_envelope, capture_environment
-    from reflex.eval.runner_dispatch import default_libero_tasks, resolve_task_runner
+    from reflex.eval.runner_dispatch import (
+        default_libero_tasks,
+        resolve_suite_runner,
+        resolve_task_runner,
+    )
 
     # ---- Validate inputs at the CLI layer (fail loud) ----
     export_path = Path(export_dir)
@@ -972,21 +976,44 @@ def eval_cmd(
         f"  [green]Pre-flight OK[/green] ({preflight_result.elapsed_s:.1f}s)"
     )
 
-    # ---- Resolve task runner + dispatch ----
-    # Day 3: stub runners emit adapter_error episodes with deferral message.
-    # Day 4 wires the Modal subprocess wrapper; Day 5 wires the local runner.
-    task_runner = resolve_task_runner(runtime=runtime, export_dir=export_path)
-    tasks_provider = (
-        None if parsed_tasks else default_libero_tasks
-    )
-
+    # ---- Resolve runner + dispatch ----
+    # Modal: full-suite dispatch via reflex.eval.modal_runner (one Modal
+    # call per suite; saves N cold-starts vs per-episode fan-out).
+    # Local: per-(task, episode) dispatch via LiberoSuite.run loop.
     console.print(f"\n[dim]Running suite...[/dim]")
-    report = LiberoSuite.run(
-        export_dir=export_path,
-        config=config,
-        task_runner=task_runner,
-        tasks_provider=tasks_provider,
-    )
+    # Resolve task list (modal_runner needs explicit tasks; LiberoSuite.run
+    # accepts a tasks_provider fallback).
+    runtime_config = config
+    if not parsed_tasks:
+        runtime_config = LiberoSuiteConfig(
+            num_episodes=num_episodes,
+            tasks=tuple(default_libero_tasks()),
+            runtime=runtime, video=video, output_dir=output, seed=seed,
+            max_parallel=max_parallel, cost_preview=cost_preview,
+        )
+
+    if runtime == "modal":
+        from reflex.eval.modal_runner import ModalNotInstalledError
+        suite_runner = resolve_suite_runner(
+            runtime=runtime, export_dir=export_path,
+        )
+        try:
+            report = suite_runner(runtime_config, export_path)
+        except ModalNotInstalledError as exc:
+            console.print(f"\n[red]{exc}[/red]")
+            raise typer.Exit(6)
+    else:
+        # local
+        task_runner = resolve_task_runner(
+            runtime=runtime, export_dir=export_path,
+        )
+        tasks_provider = None if parsed_tasks else default_libero_tasks
+        report = LiberoSuite.run(
+            export_dir=export_path,
+            config=runtime_config,
+            task_runner=task_runner,
+            tasks_provider=tasks_provider,
+        )
 
     # ---- Render summary ----
     console.print(

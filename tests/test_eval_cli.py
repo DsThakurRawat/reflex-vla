@@ -58,6 +58,30 @@ def fake_export(tmp_path):
     return p
 
 
+@pytest.fixture
+def stub_modal_runner(monkeypatch):
+    """Stub modal_runner.run_libero_on_modal so tests don't hit real Modal.
+    Returns 1 episode per task with terminal_reason='adapter_error' to
+    preserve the Day 3 "exit 5 on all-adapter-error" CLI semantics."""
+    from reflex.eval.libero import EpisodeResult
+
+    def _stub(*, config, export_dir, **kwargs):
+        # Synthesize 1 EpisodeResult per task in config.tasks
+        out = []
+        for task in config.tasks:
+            out.append(EpisodeResult(
+                task_id=task, episode_index=0,
+                success=False, terminal_reason="adapter_error",
+                wall_clock_s=0.0, n_steps=0,
+                video_path=None, error_message="stubbed in tests",
+            ))
+        return out
+
+    monkeypatch.setattr(
+        "reflex.eval.modal_runner.run_libero_on_modal", _stub,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Validation — fail-loud on bad inputs
 # ---------------------------------------------------------------------------
@@ -108,7 +132,7 @@ def test_eval_rejects_zero_max_parallel(fake_export):
 # ---------------------------------------------------------------------------
 
 
-def test_eval_prints_banner_with_inputs(fake_export, stub_preflight_pass):
+def test_eval_prints_banner_with_inputs(fake_export, stub_preflight_pass, stub_modal_runner):
     result = runner.invoke(
         app, ["eval", str(fake_export), "--suite", "libero",
               "--runtime", "modal", "--num-episodes", "2",
@@ -122,7 +146,7 @@ def test_eval_prints_banner_with_inputs(fake_export, stub_preflight_pass):
     assert "42" in result.stdout
 
 
-def test_eval_banner_marks_video_when_set(fake_export, stub_preflight_pass):
+def test_eval_banner_marks_video_when_set(fake_export, stub_preflight_pass, stub_modal_runner):
     result = runner.invoke(
         app, ["eval", str(fake_export), "--video"],
     )
@@ -216,14 +240,14 @@ def test_eval_aborts_on_preflight_failure(fake_export, stub_preflight_fail):
     assert "robosuite==1.4.1" in result.stdout  # remediation surfaced
 
 
-def test_eval_continues_on_preflight_pass(fake_export, stub_preflight_pass):
+def test_eval_continues_on_preflight_pass(fake_export, stub_preflight_pass, stub_modal_runner):
     result = runner.invoke(app, ["eval", str(fake_export)])
     # Pre-flight OK + Day 3 stub runners → exit 5 (all adapter_error)
     assert "Pre-flight OK" in result.stdout
     assert result.exit_code == 5
 
 
-def test_eval_passes_preflight_timeout_through(fake_export, monkeypatch):
+def test_eval_passes_preflight_timeout_through(fake_export, monkeypatch, stub_modal_runner):
     captured = {}
 
     def _stub(*, timeout_s, **kwargs):
@@ -247,7 +271,7 @@ def test_eval_passes_preflight_timeout_through(fake_export, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_day3_stub_runner_exits_5_on_all_adapter_error(fake_export, stub_preflight_pass):
+def test_day3_stub_runner_exits_5_on_all_adapter_error(fake_export, stub_preflight_pass, stub_modal_runner):
     """Day 3 ships stub runners — every episode is adapter_error. CLI exits 5
     so CI doesn't mistake substrate-only for success."""
     result = runner.invoke(
@@ -259,7 +283,7 @@ def test_day3_stub_runner_exits_5_on_all_adapter_error(fake_export, stub_preflig
     assert "Day" in result.stdout  # mentions deferral
 
 
-def test_day3_emits_per_task_table(fake_export, stub_preflight_pass):
+def test_day3_emits_per_task_table(fake_export, stub_preflight_pass, stub_modal_runner):
     result = runner.invoke(
         app, ["eval", str(fake_export),
               "--tasks", "libero_spatial,libero_object", "--num-episodes", "1"],
@@ -270,7 +294,7 @@ def test_day3_emits_per_task_table(fake_export, stub_preflight_pass):
     assert "libero_object" in result.stdout
 
 
-def test_day3_creates_output_directory(fake_export, stub_preflight_pass, tmp_path):
+def test_day3_creates_output_directory(fake_export, stub_preflight_pass, stub_modal_runner, tmp_path):
     out = tmp_path / "my-eval-output"
     runner.invoke(
         app, ["eval", str(fake_export),
@@ -280,7 +304,7 @@ def test_day3_creates_output_directory(fake_export, stub_preflight_pass, tmp_pat
     assert out.exists() and out.is_dir()
 
 
-def test_day4_writes_json_envelope_to_output(fake_export, stub_preflight_pass, tmp_path):
+def test_day4_writes_json_envelope_to_output(fake_export, stub_preflight_pass, stub_modal_runner, tmp_path):
     """Day 4 wires build_envelope + write_json — report.json appears in --output."""
     import json
     out = tmp_path / "eval-out"
@@ -307,7 +331,7 @@ def test_day4_writes_json_envelope_to_output(fake_export, stub_preflight_pass, t
 # ---------------------------------------------------------------------------
 
 
-def test_tasks_csv_strips_whitespace(fake_export, stub_preflight_pass):
+def test_tasks_csv_strips_whitespace(fake_export, stub_preflight_pass, stub_modal_runner):
     result = runner.invoke(
         app, ["eval", str(fake_export),
               "--tasks", " libero_spatial , libero_object ",
@@ -317,7 +341,7 @@ def test_tasks_csv_strips_whitespace(fake_export, stub_preflight_pass):
     assert "libero_object" in result.stdout
 
 
-def test_tasks_csv_drops_empty_entries(fake_export, stub_preflight_pass):
+def test_tasks_csv_drops_empty_entries(fake_export, stub_preflight_pass, stub_modal_runner):
     result = runner.invoke(
         app, ["eval", str(fake_export),
               "--tasks", "libero_spatial,,libero_object,",
@@ -352,6 +376,9 @@ def test_resolve_task_runner_local_returns_callable(tmp_path):
 
 
 def test_modal_stub_runner_emits_adapter_error(tmp_path):
+    """Modal per-episode stub is back-compat only -- real Modal callers
+    use resolve_suite_runner. Verifies the per-episode shape still
+    surfaces a structured adapter_error row."""
     from reflex.eval.libero import LiberoSuiteConfig
     from reflex.eval.runner_dispatch import resolve_task_runner
 
@@ -360,7 +387,8 @@ def test_modal_stub_runner_emits_adapter_error(tmp_path):
     result = fn("libero_spatial", 0, config)
     assert result.terminal_reason == "adapter_error"
     assert not result.success
-    assert "Day 4" in result.error_message
+    assert "deprecated" in result.error_message
+    assert "resolve_suite_runner" in result.error_message
 
 
 def test_local_stub_runner_emits_adapter_error(tmp_path):
@@ -372,7 +400,7 @@ def test_local_stub_runner_emits_adapter_error(tmp_path):
     result = fn("libero_spatial", 0, config)
     assert result.terminal_reason == "adapter_error"
     assert not result.success
-    assert "Day 5" in result.error_message
+    assert "Phase 1 follow-up" in result.error_message
 
 
 def test_default_libero_tasks_returns_phase1_list():
