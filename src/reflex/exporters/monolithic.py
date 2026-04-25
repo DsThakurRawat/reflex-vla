@@ -1283,8 +1283,14 @@ def _model_type_from_local_config(model_id: str) -> str | None:
         return None
 
     # HF transformers convention: 'model_type' field.
-    # lerobot convention: 'policy_type' field (e.g., 'pi05', 'smolvla').
-    raw = cfg.get("model_type") or cfg.get("policy_type")
+    # lerobot policy convention: 'policy_type' field.
+    # SnapFlow checkpoint convention: 'type' field
+    # (e.g., 'pi05', 'smolvla'). Caught by 2026-04-25 distill smoke v2.
+    raw = (
+        cfg.get("model_type")
+        or cfg.get("policy_type")
+        or cfg.get("type")
+    )
     if not isinstance(raw, str):
         return None
     raw = raw.lower()

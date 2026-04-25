@@ -54,6 +54,25 @@ def test_helper_extracts_pi05_from_policy_type_field(tmp_path):
     assert _model_type_from_local_config(str(tmp_path)) == "pi05"
 
 
+def test_helper_extracts_pi05_from_type_field(tmp_path):
+    """SnapFlow checkpoint convention uses `type`, not `model_type` or
+    `policy_type`. Caught by 2026-04-25 distill smoke v2."""
+    (tmp_path / "config.json").write_text(json.dumps({
+        "type": "pi05",
+    }))
+    assert _model_type_from_local_config(str(tmp_path)) == "pi05"
+
+
+def test_helper_prefers_model_type_over_type_field(tmp_path):
+    """When both fields present, model_type wins (HF convention is
+    canonical when unambiguous)."""
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "pi05",
+        "type": "should-not-be-used",
+    }))
+    assert _model_type_from_local_config(str(tmp_path)) == "pi05"
+
+
 def test_helper_extracts_smolvla(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({
         "policy_type": "smolvla",
