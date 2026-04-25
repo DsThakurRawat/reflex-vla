@@ -478,20 +478,56 @@ def _probe_driver_version() -> tuple[int, int]:
 
 
 def _probe_cuda_version() -> tuple[int, int]:
-    """Probe CUDA toolkit version (major.minor)."""
+    """Probe CUDA version (major.minor).
+
+    Tries 3 sources in order: torch.version.cuda (most reliable -- works
+    in slim images without dev tools), nvcc --version (dev image),
+    nvidia-smi (last resort, returns driver-cuda not toolkit-cuda).
+    Returns (0, 0) when all sources fail (e.g., CPU-only host).
+
+    Caught by 2026-04-25 calibration matrix Modal smoke: nvcc was
+    absent in the slim image, falling through to sentinel (0, 0).
+    """
+    # 1. torch.version.cuda is the most reliable on inference machines
+    #    (debian_slim images ship torch but not cuda-dev).
+    try:
+        import torch
+        cuda_str = getattr(torch.version, "cuda", None)
+        if cuda_str:
+            m = re.match(r"(\d+)\.(\d+)", cuda_str)
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2. nvcc (dev images / full CUDA installs)
     try:
         result = subprocess.run(
             ["nvcc", "--version"],
             capture_output=True, text=True, timeout=5.0,
         )
-        if result.returncode != 0:
-            return (0, 0)
-        m = re.search(r"release (\d+)\.(\d+)", result.stdout)
-        if not m:
-            return (0, 0)
-        return (int(m.group(1)), int(m.group(2)))
+        if result.returncode == 0:
+            m = re.search(r"release (\d+)\.(\d+)", result.stdout)
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
     except Exception:  # noqa: BLE001
-        return (0, 0)
+        pass
+
+    # 3. nvidia-smi reports driver's CUDA, which differs from toolkit
+    #    but is better than nothing for image-cache-validity comparison.
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=cuda_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5.0,
+        )
+        if result.returncode == 0:
+            m = re.match(r"\s*(\d+)\.(\d+)", result.stdout)
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
+    except Exception:  # noqa: BLE001
+        pass
+
+    return (0, 0)
 
 
 def _probe_ram_gb() -> int:
