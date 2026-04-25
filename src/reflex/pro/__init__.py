@@ -56,6 +56,11 @@ from reflex.pro.rollback import (
     RollbackHandler,
     RollbackOutcome,
 )
+from reflex.pro.drift_detection import (
+    DriftDetector,
+    DriftReport,
+    JointDriftScore,
+)
 from reflex.pro.weekly_report import (
     RollbackEntry,
     TaskDelta,
@@ -83,6 +88,8 @@ __all__ = [
     "ConsentReceipt",
     "ConsentRequired",
     "DistillScheduler",
+    "DriftDetector",
+    "DriftReport",
     "EvalGate",
     "EvalReport",
     "EvalSample",
@@ -98,6 +105,7 @@ __all__ = [
     "HfPushOutcome",
     "HfRepoSpec",
     "InsufficientEpisodes",
+    "JointDriftScore",
     "KickDecision",
     "LicenseCorrupt",
     "LicenseError",
