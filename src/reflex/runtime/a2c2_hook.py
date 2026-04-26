@@ -66,9 +66,13 @@ class A2C2HookConfig:
                 f"latency_threshold_ms must be positive, got "
                 f"{self.latency_threshold_ms}"
             )
-        if not (0.0 <= self.success_threshold <= 1.0):
+        # Allow values > 1.0 as a documented "never skip due to success" sentinel
+        # (e.g., 1.01 disables success-based skip — useful for measurement runs
+        # where the success metric is /act error rate, not task success).
+        # Hard cap at 2.0 to catch typos like 100 instead of 1.0.
+        if not (0.0 <= self.success_threshold <= 2.0):
             raise ValueError(
-                f"success_threshold must be in [0, 1], got "
+                f"success_threshold must be in [0, 2.0] (1.01+ disables skip), got "
                 f"{self.success_threshold}"
             )
         if self.latency_window < 1:

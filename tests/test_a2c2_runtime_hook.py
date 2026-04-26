@@ -49,12 +49,21 @@ def test_config_rejects_success_threshold_out_of_range():
     with pytest.raises(ValueError, match="success_threshold"):
         A2C2HookConfig(success_threshold=-0.1)
     with pytest.raises(ValueError, match="success_threshold"):
-        A2C2HookConfig(success_threshold=1.1)
+        A2C2HookConfig(success_threshold=2.1)  # 2.0 is the upper bound (1.01+ disables skip)
 
 
 def test_config_accepts_boundary_success_thresholds():
     A2C2HookConfig(success_threshold=0.0)
     A2C2HookConfig(success_threshold=1.0)
+
+
+def test_config_accepts_disable_skip_sentinel():
+    """Values in (1.0, 2.0] disable success-based skip — used in measurement
+    runs where the success metric is /act error rate, not task success."""
+    h = A2C2HookConfig(success_threshold=1.01)
+    assert h.success_threshold == 1.01
+    h2 = A2C2HookConfig(success_threshold=2.0)
+    assert h2.success_threshold == 2.0
 
 
 def test_config_rejects_zero_window_sizes():
