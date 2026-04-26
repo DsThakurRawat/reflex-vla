@@ -33,12 +33,17 @@ COPY src/ ./src/
 #   - onnxruntime: arm64 wheels exist (CPU provider; CUDA provider requires
 #                  host libs via nvidia container runtime)
 #   - transformers, safetensors, onnx: pure-python or arm64-native wheels
-# We install the [serve] extra (ORT CPU + FastAPI + lerobot).
+# We install ONLY the [serve] extra. Jetson customers RUN inference
+# (FastAPI + ORT) -- they don't run the export pipeline (which requires
+# [monolithic]'s lerobot dep, which transitively pulls evdev that needs
+# linux-input-headers + gcc to source-build on slim images). Customers who
+# need to export should do that on an x86 workstation and deploy the
+# resulting ONNX dir to the Jetson.
 # NOTE: [gpu] extra is NOT installed here — onnxruntime-gpu's CUDA
 # dependencies are pinned to specific CUDA major versions that won't
 # match Jetson's JetPack CUDA. Jetson users install onnxruntime-gpu
 # via JetPack-compatible wheels themselves (see NVIDIA's Jetson Zoo).
-RUN pip install --no-cache-dir ".[serve,monolithic]"
+RUN pip install --no-cache-dir ".[serve]"
 
 EXPOSE 8000
 VOLUME ["/exports"]
