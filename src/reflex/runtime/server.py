@@ -2114,14 +2114,31 @@ def create_app(
                 try:
                     actions_arr = np.asarray(result["actions"], dtype=np.float32)
                     if actions_arr.ndim == 2:
+                        # The model's action chunk may be padded (e.g., pi05 emits
+                        # max_action_dim=32 padded actions). The A2C2 head was
+                        # trained on the customer's REAL action_dim (e.g., 7 for
+                        # LIBERO franka). Slice to the head's action_dim before
+                        # passing to the hook + write the corrected leading slice
+                        # back into the full chunk. Caught 2026-04-26: the hook
+                        # was rejecting every call with "actions shape mismatch:
+                        # expected (chunk_size, 7), got (50, 32)".
+                        hook_dim = _a2c2.head.config.action_dim
+                        full_dim = actions_arr.shape[1]
+                        actions_for_hook = actions_arr[:, :hook_dim].copy()
                         corrected, decision, magnitude = _a2c2.maybe_apply_to_chunk(
-                            actions=actions_arr,
+                            actions=actions_for_hook,
                         )
                         result["a2c2_applied"] = decision.apply
                         result["a2c2_reason"] = decision.reason
                         result["a2c2_correction_magnitude"] = round(magnitude, 6)
                         if decision.apply:
-                            result["actions"] = corrected.tolist()
+                            if full_dim > hook_dim:
+                                # Splice corrected values back into the leading
+                                # hook_dim of the full padded chunk.
+                                actions_arr[:, :hook_dim] = corrected
+                                result["actions"] = actions_arr.tolist()
+                            else:
+                                result["actions"] = corrected.tolist()
                         span.set_attribute("reflex.a2c2.applied", decision.apply)
                         span.set_attribute("reflex.a2c2.reason", decision.reason)
                 except Exception as exc:  # noqa: BLE001 — A2C2 must never break /act
