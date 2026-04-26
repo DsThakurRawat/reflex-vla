@@ -154,6 +154,7 @@ def libero_via_serve(
     task_suite_name: str = "libero_10",
     task_indices: list[int] | None = None,
     a2c2_checkpoint: str = "",
+    inject_latency_ms: float = 0.0,
     seed: int = 7,
     serve_health_timeout_s: int = 480,
     serve_port: int = 8000,
@@ -211,6 +212,8 @@ def libero_via_serve(
     ]
     if a2c2_checkpoint:
         serve_cmd.extend(["--a2c2-checkpoint", a2c2_checkpoint])
+    if inject_latency_ms > 0:
+        serve_cmd.extend(["--inject-latency-ms", str(int(inject_latency_ms))])
 
     print(f"[libero_via_serve] starting: {' '.join(serve_cmd)}")
     serve_proc = subprocess.Popen(
@@ -444,6 +447,7 @@ def main(
     tasks: str = "0",
     suite: str = "libero_10",
     a2c2_checkpoint: str = "",
+    inject_latency_ms: float = 0.0,
 ):
     """Run LIBERO via reflex serve.
 
@@ -451,19 +455,22 @@ def main(
     --tasks "0,1,2"      3 tasks
     --tasks "all"        full suite
     --a2c2-checkpoint /gate_out/.../a2c2_head.npz  enable A2C2
+    --inject-latency-ms 100  synthetic latency for A2C2 measurement (ADR 2026-04-24)
     """
     if tasks == "all":
         task_list = None
     else:
         task_list = [int(t) for t in tasks.split(",")]
     print(f"Running LIBERO {suite} via reflex serve: tasks={task_list or 'all'}, "
-          f"{num_episodes} eps each, a2c2={a2c2_checkpoint or '(off)'}")
+          f"{num_episodes} eps each, a2c2={a2c2_checkpoint or '(off)'}, "
+          f"inject_latency_ms={inject_latency_ms}")
     r = libero_via_serve.remote(
         export_subdir=export_subdir,
         num_episodes=num_episodes,
         task_suite_name=suite,
         task_indices=task_list,
         a2c2_checkpoint=a2c2_checkpoint,
+        inject_latency_ms=inject_latency_ms,
     )
     print("\n=== RESULT ===")
     if r.get("status") == "fail":
