@@ -2927,7 +2927,7 @@ def go(
         help="Probe + resolve + print plan; do not pull or serve.",
     ),
 ):
-    """One-command deploy: probe hardware → pick model → pull → serve.
+    """One-command deploy: probe hardware → pick model → pull → export → serve.
 
     Examples:
       reflex go --model pi05 --embodiment franka
@@ -2935,9 +2935,13 @@ def go(
       reflex go --model pi05-libero --dry-run
 
     For models that ship as raw PyTorch (requires_export=True in registry),
-    this command pulls + prints the export command to run next. For models
-    that are Reflex-pre-exported (requires_export=False), it pulls + serves
-    in one shot.
+    this command pulls + exports inline (5-15 min) + serves. The export step
+    requires the [monolithic] extra:
+      pip install 'reflex-vla[monolithic]'
+    Without it, `reflex go` errors with the install command.
+
+    Exported artifacts cache at ~/.cache/reflex/exports/<model_id>/ — re-runs
+    skip the export on cache hit.
 
     Plan ref: features/01_serve/subfeatures/_dx_gaps/one-command-deploy.md
     """
@@ -2986,8 +2990,8 @@ def go(
 
     if dry_run:
         console.print(f"[bold cyan]target:[/bold cyan]   {target}")
-        console.print(f"\n[bold green]DRY RUN[/bold green] — would pull weights "
-                      f"and {'print export instructions' if entry.requires_export else 'start serve on port ' + str(port)}.")
+        next_step = "export inline then serve" if entry.requires_export else f"start serve on port {port}"
+        console.print(f"\n[bold green]DRY RUN[/bold green] — would pull weights and {next_step}.")
         return
 
     # Step 4: pull (skip if already cached + non-empty)
@@ -3012,22 +3016,66 @@ def go(
             console.print(f"[red]Download failed: {type(e).__name__}: {e}[/red]")
             raise typer.Exit(1)
 
-    # Step 5: hand off to serve OR print export instructions
+    # Step 5: if model ships as raw weights, export inline before serving.
+    # device_class (probe namespace) → target (HARDWARE_PROFILES namespace).
+    _DEVICE_CLASS_TO_TARGET = {
+        "orin_nano": "orin-nano",
+        "agx_orin": "orin",
+        "thor": "thor",
+        "h200": "desktop", "h100": "desktop", "a100": "desktop",
+        "a10g": "desktop", "cpu": "desktop",
+    }
     if entry.requires_export:
-        console.print(
-            f"\n[yellow]This model ships as raw weights and needs export first:[/yellow]\n"
-            f"  [cyan]reflex export {target}[/cyan]\n"
-            f"Then re-run [cyan]reflex go --model {entry.model_id}[/cyan] "
-            f"(it will skip the pull on the cache hit and serve the exported dir)."
-        )
-        console.print(
-            f"\n[dim]Auto-export integration is gated on Phase 1 work (large + heavy "
-            f"deps; not in `reflex go` scope today). Track at "
-            f"features/01_serve/subfeatures/_dx_gaps/one-command-deploy.md.[/dim]"
-        )
-        raise typer.Exit(0)
+        export_target = _DEVICE_CLASS_TO_TARGET.get(probe.device_class, "desktop")
+        # Respect REFLEX_HOME for cache root so tests + custom installs can override.
+        reflex_home = Path(os.environ.get("REFLEX_HOME", Path.home() / ".cache" / "reflex"))
+        export_dir = reflex_home / "exports" / entry.model_id
+        export_marker = export_dir / "VERIFICATION.md"
 
-    # requires_export=False → start serve directly
+        if export_marker.exists():
+            console.print(f"[bold cyan]export hit:[/bold cyan] {export_dir} already populated; skipping export.")
+        else:
+            console.print(
+                f"[bold cyan]exporting:[/bold cyan] {target} → {export_dir} "
+                f"(target={export_target}, monolithic, 5-15 min depending on hardware)"
+            )
+            from reflex.exporters.monolithic import export_monolithic  # module always importable
+            export_dir.mkdir(parents=True, exist_ok=True)
+            import time as _time
+            _t0 = _time.perf_counter()
+            try:
+                result = export_monolithic(
+                    str(target), str(export_dir),
+                    num_steps=10, target=export_target,
+                )
+            except ImportError as exc:
+                # export_monolithic does its own runtime dep check (lerobot, onnx-diagnostic, scipy);
+                # these aren't in the base install. Surface the same hint reflex export uses.
+                console.print(f"{exc}", style="red", markup=False)
+                console.print(
+                    "\n`reflex go` needs the monolithic export extras to deploy this model.\n"
+                    "Fix: pip install 'reflex-vla[monolithic]'\n"
+                    "(pins transformers==5.3.0; use a clean venv to avoid the "
+                    "base transformers<5.0 conflict)",
+                    style="cyan", markup=False,
+                )
+                raise typer.Exit(2)
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"Export failed: {type(exc).__name__}: {exc}", style="red", markup=False)
+                raise typer.Exit(1)
+            elapsed = _time.perf_counter() - _t0
+            console.print(f"[bold green]export complete in {elapsed:.1f}s[/bold green]  ONNX={result.get('onnx_path','?')} ({result.get('size_mb',0):.0f} MB)")
+
+            try:
+                from reflex.verification_report import write_verification_report
+                write_verification_report(str(export_dir), parity=None)
+            except Exception:  # noqa: BLE001
+                pass  # Verification manifest is informational, not load-bearing
+
+        # Hand off serve to the exported dir, not the raw weights dir.
+        target = export_dir
+
+    # requires_export=False (or just-exported) → start serve directly
     console.print(f"\n[bold green]Starting serve on http://{host}:{port}[/bold green]")
     from reflex.runtime.server import create_app
 

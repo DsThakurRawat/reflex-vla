@@ -222,10 +222,12 @@ class TestReflexGoCli:
         assert result.exit_code == 2
         assert "No registry entry" in result.stdout or "Unknown" in result.stdout
 
-    def test_pull_then_export_hint_for_requires_export_model(self, runner, cli_app, tmp_path):
-        # Empty target dir → reflex go SHOULD call snapshot_download.
-        # Mock snapshot_download to "do the download" by writing one file.
+    def test_pull_then_export_then_serve_for_requires_export_model(self, runner, cli_app, tmp_path, monkeypatch):
+        # Empty target dir → snapshot_download runs.
+        # requires_export=True → export_monolithic runs (mocked).
+        # Then serve startup attempts (we mock create_app so the test stops there).
         target = tmp_path / "model_cache"
+        monkeypatch.setenv("REFLEX_HOME", str(tmp_path / "reflex_cache"))  # isolate export cache
 
         def fake_dl(**kwargs):
             local_dir = Path(kwargs["local_dir"])
@@ -233,30 +235,69 @@ class TestReflexGoCli:
             (local_dir / "config.json").write_text("{}")
             return str(local_dir)
 
-        with patch("huggingface_hub.snapshot_download", side_effect=fake_dl) as mock_dl:
+        def fake_export(model_path, output_dir, num_steps=10, target=None):
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(output_dir) / "VERIFICATION.md").write_text("# stub")
+            return {"onnx_path": str(Path(output_dir) / "model.onnx"), "size_mb": 100.0}
+
+        with patch("huggingface_hub.snapshot_download", side_effect=fake_dl) as mock_dl, \
+             patch("reflex.exporters.monolithic.export_monolithic", side_effect=fake_export) as mock_export, \
+             patch("reflex.runtime.server.create_app", side_effect=RuntimeError("serve-stub")):
             result = runner.invoke(cli_app, [
                 "go",
                 "--model", "smolvla-base",
                 "--device-class", "a10g",
                 "--target-dir", str(target),
             ])
-        # smolvla-base has requires_export=True → should print the export hint then exit 0
-        assert result.exit_code == 0, result.stdout
-        assert "reflex export" in result.stdout
+        # We expect the pull + export + serve-attempt path; serve fails on the stub.
+        # Exit is non-zero because of the create_app stub, but pull + export must have run.
         mock_dl.assert_called_once()
         assert mock_dl.call_args.kwargs["repo_id"] == "lerobot/smolvla_base"
+        mock_export.assert_called_once()
+        assert "exporting:" in result.stdout
+        assert "export complete" in result.stdout
 
-    def test_cache_hit_skips_pull(self, runner, cli_app, tmp_path):
+    def test_cache_hit_skips_pull(self, runner, cli_app, tmp_path, monkeypatch):
         target = tmp_path / "cached"
         target.mkdir()
         (target / "already_present.txt").write_text("hi")
-        with patch("huggingface_hub.snapshot_download") as mock_dl:
+        monkeypatch.setenv("REFLEX_HOME", str(tmp_path / "reflex_cache"))
+
+        def fake_export(model_path, output_dir, num_steps=10, target=None):
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(output_dir) / "VERIFICATION.md").write_text("# stub")
+            return {"onnx_path": str(Path(output_dir) / "model.onnx"), "size_mb": 100.0}
+
+        with patch("huggingface_hub.snapshot_download") as mock_dl, \
+             patch("reflex.exporters.monolithic.export_monolithic", side_effect=fake_export), \
+             patch("reflex.runtime.server.create_app", side_effect=RuntimeError("serve-stub")):
             result = runner.invoke(cli_app, [
                 "go",
                 "--model", "smolvla-base",
                 "--device-class", "a10g",
                 "--target-dir", str(target),
             ])
-        assert result.exit_code == 0, result.stdout
         assert "cache hit" in result.stdout
         mock_dl.assert_not_called()
+
+    def test_export_dep_missing_errors_with_monolithic_install_hint(self, runner, cli_app, tmp_path, monkeypatch):
+        # Without the [monolithic] extras, export_monolithic raises ImportError.
+        # `reflex go` should catch it, print the install hint, and exit 2.
+        target = tmp_path / "cached"
+        target.mkdir()
+        (target / "weights.bin").write_text("stub")
+        monkeypatch.setenv("REFLEX_HOME", str(tmp_path / "reflex_cache"))
+
+        with patch(
+            "reflex.exporters.monolithic.export_monolithic",
+            side_effect=ImportError("Missing dependencies: lerobot==0.5.1, onnx-diagnostic"),
+        ):
+            result = runner.invoke(cli_app, [
+                "go",
+                "--model", "smolvla-base",
+                "--device-class", "a10g",
+                "--target-dir", str(target),
+            ])
+        assert result.exit_code == 2, result.stdout
+        assert "monolithic" in result.stdout
+        assert "pip install" in result.stdout
