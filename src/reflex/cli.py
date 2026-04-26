@@ -1968,14 +1968,41 @@ def ros2_serve(
     rate_hz: float = typer.Option(20.0, help="Inference rate (Hz)"),
     safety_config: str = typer.Option("", help="Path to SafetyLimits JSON"),
     node_name: str = typer.Option("reflex_vla", help="ROS2 node name"),
+    mcp: bool = typer.Option(
+        False,
+        "--mcp",
+        help="Also expose the live ROS2 bridge as MCP tools (4 read/actuation "
+             "tools + robot://status resource per ros2-mcp-bridge.md). Pairs "
+             "with --mcp-transport stdio for Claude Desktop / Cursor or http "
+             "for cross-process agent loops.",
+    ),
+    mcp_transport: str = typer.Option(
+        "stdio",
+        "--mcp-transport",
+        help="MCP transport when --mcp is set. 'stdio' (Claude Desktop default; "
+             "MCP owns stdin/stdout, rclpy spins in background thread) or 'http' "
+             "(MCP runs on --mcp-port background thread; rclpy.spin owns main).",
+    ),
+    mcp_port: int = typer.Option(
+        8001,
+        "--mcp-port",
+        help="MCP HTTP port (only used with --mcp-transport http).",
+    ),
 ):
-    """Run a ROS2 node wrapping reflex inference.
+    """Run a ROS2 node wrapping reflex inference; optionally expose as MCP.
 
     Requires ROS2 installed via apt or robostack (rclpy is NOT pip-installable).
     Source your ROS2 environment before running:
 
         source /opt/ros/humble/setup.bash   # or iron / jazzy
         reflex ros2-serve ./my_export/
+
+    With --mcp, exposes the live ROS2 bridge as MCP tools so coding agents
+    (Claude, Cursor, custom) can introspect AND drive the robot through one
+    connection. Per ros2-mcp-bridge.md (Phase 1.5).
+
+        reflex ros2-serve ./my_export/ --mcp                     # stdio
+        reflex ros2-serve ./my_export/ --mcp --mcp-transport http --mcp-port 8001
     """
     try:
         from reflex.runtime.ros2_bridge import run_ros2_bridge
@@ -1983,12 +2010,21 @@ def ros2_serve(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(2)
 
+    if mcp and mcp_transport not in ("stdio", "http"):
+        console.print(
+            f"[red]Invalid --mcp-transport {mcp_transport!r}; "
+            f"expected 'stdio' or 'http'.[/red]"
+        )
+        raise typer.Exit(1)
+
     console.print(f"[bold green]Starting reflex ros2 bridge[/bold green]")
     console.print(f"  export_dir: {export_dir}")
     console.print(f"  node_name: {node_name}")
     console.print(f"  rate_hz: {rate_hz}")
     console.print(f"  subs: {image_topic}, {state_topic}, {task_topic}")
     console.print(f"  pub:  {action_topic}")
+    if mcp:
+        console.print(f"  mcp:  {mcp_transport}" + (f" (port {mcp_port})" if mcp_transport == "http" else ""))
     try:
         run_ros2_bridge(
             export_dir,
@@ -2000,6 +2036,9 @@ def ros2_serve(
             action_topic=action_topic,
             rate_hz=rate_hz,
             node_name=node_name,
+            mcp=mcp,
+            mcp_transport=mcp_transport,
+            mcp_port=mcp_port,
         )
     except ImportError as exc:
         console.print(f"[red]{exc}[/red]")

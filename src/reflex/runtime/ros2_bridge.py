@@ -218,10 +218,32 @@ def run_ros2_bridge(
     action_topic: str = "/reflex/actions",
     rate_hz: float = 20.0,
     node_name: str = "reflex_vla",
+    mcp: bool = False,
+    mcp_transport: str = "stdio",
+    mcp_port: int = 8001,
 ) -> None:
-    """Load the model, init rclpy, spin the bridge node until shutdown."""
+    """Load the model, init rclpy, spin the bridge node until shutdown.
+
+    When ``mcp=True``, also start an MCP server that exposes the running
+    ROS2 bridge as agent-callable tools (per ros2-mcp-bridge.md). The bridge
+    node already implements ``ROS2Context``, so it binds directly via
+    ``register_ros2_tools(mcp, node)``.
+
+    Concurrency model:
+    - mcp=False: single-threaded, ``rclpy.spin(node)`` blocks until shutdown.
+    - mcp=True, transport="stdio": MCP owns stdin/stdout; rclpy spins in a
+      background thread (MultiThreadedExecutor); MCP runs on the main thread
+      so its stdio plumbing works. Used for Claude Desktop / Cursor.
+    - mcp=True, transport="http": MCP runs in background thread on
+      ``mcp_port``; ``rclpy.spin(node)`` blocks on main thread.
+    """
     rclpy, _, _, _, _, _ = _require_rclpy()
     from reflex.runtime.server import ReflexServer
+
+    if mcp and mcp_transport not in ("stdio", "http"):
+        raise ValueError(
+            f"mcp_transport must be 'stdio' or 'http', got {mcp_transport!r}"
+        )
 
     server = ReflexServer(
         export_dir,
@@ -234,6 +256,7 @@ def run_ros2_bridge(
 
     rclpy.init()
     node = None
+    mcp_srv = None
     try:
         node = create_ros2_bridge_node(
             server,
@@ -244,7 +267,75 @@ def run_ros2_bridge(
             rate_hz=rate_hz,
             node_name=node_name,
         )
-        rclpy.spin(node)
+
+        if not mcp:
+            rclpy.spin(node)
+            return
+
+        # MCP-enabled path: build an MCP server with the /act tools + bind
+        # ros2_tools to the live node (which implements ROS2Context).
+        try:
+            from reflex.mcp import create_mcp_server, register_ros2_tools
+        except ImportError as exc:
+            raise ImportError(
+                "MCP optional dep not installed. Run: pip install 'reflex-vla[mcp]'"
+            ) from exc
+
+        mcp_srv = create_mcp_server(server)
+        register_ros2_tools(mcp_srv, node)
+        logger.info(
+            "ros2-mcp bridge: MCP server built with /act tools + 4 ros2_tools "
+            "bound to live node %r (transport=%s)",
+            node_name, mcp_transport,
+        )
+
+        if mcp_transport == "http":
+            # MCP HTTP runs in a background thread; rclpy.spin owns the main
+            # thread (matches the legacy mcp=False path's blocking behavior).
+            import threading
+            def _run_mcp_http():
+                mcp_srv.run(
+                    transport="streamable-http",
+                    host="127.0.0.1",
+                    port=mcp_port,
+                )
+            mcp_thread = threading.Thread(
+                target=_run_mcp_http, daemon=True, name="reflex-mcp-http",
+            )
+            mcp_thread.start()
+            logger.info(
+                "ros2-mcp bridge: MCP HTTP server on http://127.0.0.1:%d "
+                "(streamable-http); rclpy.spin owns main thread",
+                mcp_port,
+            )
+            rclpy.spin(node)
+            return
+
+        # stdio transport: MCP owns the main thread (needs stdin/stdout);
+        # rclpy.spin runs in a background thread via MultiThreadedExecutor
+        # so it doesn't conflict with MCP's stdio loop.
+        from rclpy.executors import MultiThreadedExecutor
+        import threading
+        executor = MultiThreadedExecutor()
+        executor.add_node(node)
+
+        def _spin_executor():
+            try:
+                executor.spin()
+            except Exception:  # noqa: BLE001 -- background thread; log + exit
+                logger.exception("ros2-mcp bridge: rclpy executor crashed")
+
+        spin_thread = threading.Thread(
+            target=_spin_executor, daemon=True, name="reflex-rclpy-spin",
+        )
+        spin_thread.start()
+        logger.info(
+            "ros2-mcp bridge: rclpy spinning in background thread; "
+            "MCP stdio on main thread (Claude Desktop / Cursor compatible)"
+        )
+        # Blocks until MCP client disconnects
+        mcp_srv.run(transport="stdio")
+
     except KeyboardInterrupt:
         logger.info("ros2 bridge interrupted by user")
     finally:
