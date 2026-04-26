@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.4 — 2026-04-27
+
+### Changed
+- **`reflex doctor` now suggests the right install extras for your platform.** On Apple Silicon (no NVIDIA), recommends `'reflex-vla[serve,onnx]'` (CPU runtime). On NVIDIA boxes, still recommends `'reflex-vla[serve,gpu]'`.
+- **`reflex models pull` now accepts HuggingFace repo IDs** in addition to registry aliases. `reflex models pull lerobot/smolvla_base` works just like `reflex models pull smolvla-base` — automatically resolved to the registry entry.
+
+### Fixed
+- Doctor's install hint no longer eats `[serve,gpu]` due to Rich markup interpretation (escaped properly with raw string + escaped bracket).
+
 ## v0.3.3 — 2026-04-27
 
 ### Added

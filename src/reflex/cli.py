@@ -2490,10 +2490,16 @@ def doctor(
         import uvicorn
         add("fastapi + uvicorn", True, f"fastapi {fastapi.__version__} / uvicorn {uvicorn.__version__}")
     except ImportError:
+        # Recommend the right extras for this platform: NVIDIA-GPU users want gpu,
+        # everyone else (Mac, CPU-only Linux, ARM Jetson) wants onnx (CPU runtime).
+        import platform as _plat
+        is_apple_silicon = _plat.system() == "Darwin"
+        cpu_only = is_apple_silicon  # extend later: detect non-NVIDIA Linux too
+        extra = "serve,onnx" if cpu_only else "serve,gpu"
         add(
             "fastapi + uvicorn",
             False,
-            r"not installed — run `pip install reflex-vla\[serve,gpu]` for the server",
+            f"not installed — run `pip install 'reflex-vla\\[{extra}]'` for the server",
         )
 
     # safetensors
@@ -2773,17 +2779,24 @@ def models_pull(
       reflex models pull pi05-libero
       reflex models pull smolvla-base --target-dir /data/models/smolvla
     """
-    from reflex.registry import by_id
+    from reflex.registry import by_id, REGISTRY
 
     entry = by_id(model_id)
     if entry is None:
-        from reflex.registry import REGISTRY
+        # Accept the HF repo id too (`lerobot/smolvla_base` → `smolvla-base`).
+        # Saves users from having to know the registry alias.
+        for e in REGISTRY:
+            if e.hf_repo == model_id:
+                entry = e
+                break
+    if entry is None:
         available = sorted(e.model_id for e in REGISTRY)
         console.print(f"[red]Unknown model_id: {model_id!r}[/red]")
-        console.print(f"Available: {', '.join(available)}")
+        console.print(f"Available registry ids: {', '.join(available)}")
+        console.print("Tip: you can also pass the HuggingFace repo id (e.g. lerobot/smolvla_base).")
         raise typer.Exit(2)
 
-    target = Path(target_dir) if target_dir else (Path.home() / ".cache" / "reflex" / "models" / model_id)
+    target = Path(target_dir) if target_dir else (Path.home() / ".cache" / "reflex" / "models" / entry.model_id)
     target.mkdir(parents=True, exist_ok=True)
 
     rev = revision or entry.hf_revision
