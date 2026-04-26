@@ -395,10 +395,31 @@ def run_libero_onnx(
             a = t.detach().cpu().numpy()
             return a.astype(dtype) if dtype is not None else a
 
+        # Resize each camera tensor to the ONNX's expected shape if it differs.
+        # SmolVLA: all 3 cams 256x256. Pi05: image/image2 256x256, empty_camera 224x224
+        # per preprocessor JSON, but the actual ONNX trace shape is what matters --
+        # probed at session-load time. Use F.interpolate to handle any HxW mismatch.
+        # Caught 2026-04-26: cam2 (img_wrist_l) feed at 256x256 but pi05 ONNX
+        # expects 224x224.
+        def _resize_to_expected(tensor: torch.Tensor, cam_key: str) -> torch.Tensor:
+            shape = _input_shapes.get(cam_key)
+            if not (isinstance(shape, list) and len(shape) == 4):
+                return tensor
+            exp_h = shape[2] if isinstance(shape[2], int) else None
+            exp_w = shape[3] if isinstance(shape[3], int) else None
+            if exp_h is None or exp_w is None:
+                return tensor
+            if tensor.shape[-2] == exp_h and tensor.shape[-1] == exp_w:
+                return tensor
+            import torch.nn.functional as F
+            return F.interpolate(
+                tensor, size=(exp_h, exp_w), mode="bilinear", align_corners=False
+            )
+
         feed = {
-            _cam_keys[0]: _np(images[0], np.float32),
-            _cam_keys[1]: _np(images[1], np.float32),
-            _cam_keys[2]: _np(images[2], np.float32),
+            _cam_keys[0]: _np(_resize_to_expected(images[0], _cam_keys[0]), np.float32),
+            _cam_keys[1]: _np(_resize_to_expected(images[1], _cam_keys[1]), np.float32),
+            _cam_keys[2]: _np(_resize_to_expected(images[2], _cam_keys[2]), np.float32),
             _cam_keys[3]: _np(img_masks[0], bool),
             _cam_keys[4]: _np(img_masks[1], bool),
             _cam_keys[5]: _np(img_masks[2], bool),
