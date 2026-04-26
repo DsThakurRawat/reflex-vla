@@ -140,7 +140,7 @@ TASK_SUITE_MAX_STEPS = {
 @app.function(
     image=image,
     gpu="A100-80GB",
-    timeout=7200,  # 2 hr cap; LIBERO + serve startup + episode runs
+    timeout=10800,  # 3 hr cap; LIBERO + serve startup + N=50 episodes (longest seen so far ~83 min for libero_object after the 3-fix denorm/prompt/wrist patches)
     volumes={
         HF_CACHE_PATH: hf_cache,
         ONNX_OUTPUT_PATH: onnx_output,
