@@ -109,6 +109,18 @@ class Pi05DecomposedServer:
         self._model_hash: str | None = None
         self._config_hash: str | None = None
 
+        # Normalizer stats — applied to state INPUT (before inference) +
+        # action OUTPUT (after inference). Loaded in load() from the export
+        # dir's policy_(pre|post)processor_*.safetensors OR fetched from
+        # the teacher HF repo as fallback.
+        # Without these, the env executes raw normalized actions and the
+        # robot flails — caught 2026-04-26 LIBERO N=50 = 0% across all
+        # tasks before this fix landed.
+        self._action_mean: np.ndarray | None = None
+        self._action_std: np.ndarray | None = None
+        self._state_mean: np.ndarray | None = None
+        self._state_std: np.ndarray | None = None
+
         # Loaded from reflex_config.json at .load() time.
         self.config: dict[str, Any] = {}
         self.action_dim: int = 7  # set from config.action_dim during load
@@ -235,6 +247,12 @@ class Pi05DecomposedServer:
         # serving without text instructions.
         self._tokenizer = None  # populated lazily by _ensure_tokenizer
 
+        # Load normalizer stats: state-in normalization + action-out
+        # denormalization. Without these the env receives raw normalized
+        # actions and the robot flails (LIBERO success-rate ~0%; caught
+        # 2026-04-26 N=50 fire before fix shipped).
+        self._load_normalizer_stats()
+
         # Apply ActionGuard if a safety config was provided.
         if self._safety_config_path is not None:
             try:
@@ -250,6 +268,109 @@ class Pi05DecomposedServer:
 
         self._ready = True
         logger.info("Pi05DecomposedServer ready")
+
+    def _load_normalizer_stats(self) -> None:
+        """Load state/action MEAN_STD normalizer stats. Needed because the
+        decomposed model emits NORMALIZED actions; the env expects denormalized.
+
+        Lookup order:
+        1. Local: policy_(pre|post)processor_*.safetensors in self.export_dir
+        2. HF fallback: snapshot_download from teacher repo (config.model_id
+           or distill_provenance.json::teacher_export). Distill exports usually
+           don't ship normalizer files; teacher repo always does.
+
+        On miss, leaves stats=None — callers fall back to identity transforms.
+        Logs the stats-source so the customer-facing /health debug surface
+        shows whether normalization is on.
+        """
+        from reflex.runtime.adapters.vla_eval import load_normalizer_stats
+
+        # 1. Try local export dir
+        stats = load_normalizer_stats(self.export_dir)
+        source = "local-export" if stats else None
+
+        # 2. HF teacher fallback if local was empty
+        if not stats:
+            teacher_ref = self._infer_teacher_ref()
+            if teacher_ref:
+                try:
+                    from huggingface_hub import snapshot_download
+                    teacher_path = snapshot_download(
+                        teacher_ref,
+                        allow_patterns=[
+                            "policy_preprocessor*",
+                            "policy_postprocessor*",
+                        ],
+                    )
+                    stats = load_normalizer_stats(teacher_path)
+                    if stats:
+                        source = f"hf-teacher:{teacher_ref}"
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Pi05DecomposedServer normalizer fetch from teacher %r "
+                        "failed: %s",
+                        teacher_ref, exc,
+                    )
+
+        if "action_mean" in stats and "action_std" in stats:
+            self._action_mean = stats["action_mean"].astype(np.float32)
+            self._action_std = stats["action_std"].astype(np.float32)
+        if "state_mean" in stats and "state_std" in stats:
+            self._state_mean = stats["state_mean"].astype(np.float32)
+            self._state_std = stats["state_std"].astype(np.float32)
+
+        if self._action_mean is not None or self._state_mean is not None:
+            logger.info(
+                "Pi05DecomposedServer normalizer loaded from %s "
+                "(action=%s, state=%s)",
+                source,
+                "on" if self._action_mean is not None else "off",
+                "on" if self._state_mean is not None else "off",
+            )
+        else:
+            logger.warning(
+                "Pi05DecomposedServer normalizer NOT FOUND -- actions will be "
+                "in normalized space, robot will flail. "
+                "Looked in: %s + HF teacher fallback. "
+                "Fix: re-export with policy_(pre|post)processor_*.safetensors "
+                "alongside the ONNX, OR provide a teacher HF repo via "
+                "config.model_id or distill_provenance.json::teacher_export.",
+                self.export_dir,
+            )
+
+    def _infer_teacher_ref(self) -> str | None:
+        """Infer the teacher HF repo id for normalizer fallback. Returns the
+        first valid HF id from config.model_id or distill_provenance.json's
+        teacher_export, or None if neither is available."""
+        # 1. config.model_id when it looks like an HF repo id
+        model_id = self.config.get("model_id", "")
+        if (
+            isinstance(model_id, str)
+            and "/" in model_id
+            and not model_id.startswith("/")
+            and "::" not in model_id
+        ):
+            return model_id
+
+        # 2. distill_provenance.json's teacher_export
+        prov_path = self.export_dir / "distill_provenance.json"
+        if prov_path.exists():
+            try:
+                prov = json.loads(prov_path.read_text())
+                teacher = prov.get("teacher_export", "")
+                if (
+                    isinstance(teacher, str)
+                    and "/" in teacher
+                    and not teacher.startswith("/")
+                ):
+                    return teacher
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 3. Hardcoded fallback for pi05_libero distill exports (the most
+        # common case at this stage). Safe because all Reflex pi05 distills
+        # share the v044 teacher's normalizer stats.
+        return "lerobot/pi05_libero_finetuned_v044"
 
     def _ensure_tokenizer(self) -> None:
         """Lazy-load the HF tokenizer from the export dir on first use.
@@ -433,9 +554,30 @@ class Pi05DecomposedServer:
                 noise=noise, state=state_arr,
             )
 
-            # 6. Postprocess -- slice to action_dim; first batch element.
+            # 6. Postprocess -- denormalize THEN slice to action_dim.
+            # Denorm formula: action_real = action_norm * std + mean.
+            # The normalizer applies to the FULL max_action_dim padded
+            # vector (not to the sliced 7-D), since policy_postprocessor.json
+            # was fit on padded actions during distill prep.
             if actions_padded.ndim == 3:
                 actions_padded = actions_padded[0]
+            if self._action_mean is not None and self._action_std is not None:
+                # Stats are typically (action_dim,) for the real action dim.
+                # Pad them to max_action_dim for the broadcast.
+                a_mean = self._action_mean
+                a_std = self._action_std
+                ad = actions_padded.shape[-1]
+                if a_mean.shape[0] < ad:
+                    a_mean = np.concatenate([
+                        a_mean, np.zeros(ad - a_mean.shape[0], dtype=np.float32)
+                    ])
+                    a_std = np.concatenate([
+                        a_std, np.ones(ad - a_std.shape[0], dtype=np.float32)
+                    ])
+                elif a_mean.shape[0] > ad:
+                    a_mean = a_mean[:ad]
+                    a_std = a_std[:ad]
+                actions_padded = actions_padded * a_std + a_mean
             actions_out = actions_padded[:, : self.action_dim].astype(np.float32)
 
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -509,12 +651,29 @@ class Pi05DecomposedServer:
         return tokens, masks
 
     def _prep_state(self, state: list[float] | None) -> np.ndarray:
-        """Pad the state vector to max_action_dim (typically 32 for pi05).
-        Customer-side state is usually 7-14 dims; pad with zeros.
-        Returns (1, max_action_dim) float32."""
+        """Normalize + pad the state vector to max_action_dim (typically 32 for pi05).
+
+        Apply order: normalize the REAL-DIM portion (state - state_mean) /
+        (state_std + eps), then zero-pad up to max_action_dim. The normalizer
+        was fit on the real state dim (7 for LIBERO franka, etc.); padding
+        with zeros AFTER normalization keeps zeros zero-mean, which the
+        model treats as "no signal" for the unused DOFs.
+
+        Returns (1, max_action_dim) float32.
+        """
         if state is None:
             return np.zeros((1, self.max_action_dim), dtype=np.float32)
         arr = np.asarray(state, dtype=np.float32).flatten()
+
+        # Normalize the leading real-dim portion. Without this the model
+        # sees raw eef coordinates (e.g., 0.5 m) instead of zero-mean
+        # standardized inputs and predicts garbage actions.
+        if self._state_mean is not None and self._state_std is not None:
+            n = min(arr.shape[0], self._state_mean.shape[0])
+            arr_norm = arr.copy()
+            arr_norm[:n] = (arr[:n] - self._state_mean[:n]) / (self._state_std[:n] + 1e-8)
+            arr = arr_norm
+
         if arr.shape[0] > self.max_action_dim:
             arr = arr[: self.max_action_dim]
         elif arr.shape[0] < self.max_action_dim:
