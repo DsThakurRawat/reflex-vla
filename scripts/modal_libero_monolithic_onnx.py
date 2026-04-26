@@ -225,6 +225,7 @@ def run_libero_onnx(
     # Without this probe, the wrong feed dict gets a "Required inputs missing" error
     # at first sess.run (caught 2026-04-26 firing teacher pi05 eval through this script).
     _input_names = {inp.name for inp in sess.get_inputs()}
+    _input_shapes = {inp.name: inp.shape for inp in sess.get_inputs()}
     if "img_cam1" in _input_names:
         _cam_keys = ("img_cam1", "img_cam2", "img_cam3", "mask_cam1", "mask_cam2", "mask_cam3")
         print(f"[onnx] cam naming: SmolVLA-style (cam1/cam2/cam3)")
@@ -236,6 +237,13 @@ def run_libero_onnx(
             f"Unknown camera-naming convention in ONNX inputs: {sorted(_input_names)}. "
             f"Expected either img_cam1 (SmolVLA) or img_base (pi05) as first image input."
         )
+    # Probe shape of cam3 / wrist_r so the empty-camera padding matches the
+    # ONNX's expected resolution. Pi05's empty_camera_0 is 224x224 while
+    # cam1/cam2 are 256x256; SmolVLA uses 256x256 for all 3. Without this
+    # probe, the cam3 zero-tensor pad has the wrong HxW and ORT throws
+    # "INVALID_ARGUMENT: Got invalid dimensions for input: img_wrist_r".
+    _cam3_shape = _input_shapes[_cam_keys[2]]  # e.g. ['batch', 3, 224, 224]
+    print(f"[onnx] cam3 expected shape: {_cam3_shape}")
     used_providers = sess.get_providers()
     print(f"[onnx]   loaded in {time.time()-t0:.1f}s — providers={used_providers}")
     input_names = [i.name for i in sess.get_inputs()]
@@ -336,12 +344,23 @@ def run_libero_onnx(
         """
         from lerobot.utils.constants import OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
         images, img_masks = policy.prepare_images(batch_pp)
-        # SmolVLA wrapper was exported expecting exactly 3 cameras. LIBERO
-        # only has 2 (agentview + wrist); pad the 3rd slot with a zero
-        # image + empty mask, matching SmolVLA's own empty-camera code path
-        # (prepare_images uses `torch.ones_like(img) * -1` for missing cams).
+        # The ONNX wrapper expects exactly 3 cameras. LIBERO only has 2
+        # (agentview + wrist); pad the 3rd slot with a zero image + empty
+        # mask. Use the ONNX's expected cam3 shape (probed at session-load
+        # time) -- pi05's empty_camera_0 is 224x224 while cam1/cam2 are
+        # 256x256 (SmolVLA uses 256x256 for all 3). Caught 2026-04-26.
         while len(images) < 3:
-            images.append(torch.ones_like(images[0]) * -1.0)
+            if len(images) == 2 and isinstance(_cam3_shape, list) and len(_cam3_shape) == 4:
+                # _cam3_shape: ['batch'|N, C, H, W]
+                _cam3_h = _cam3_shape[2] if isinstance(_cam3_shape[2], int) else images[0].shape[-2]
+                _cam3_w = _cam3_shape[3] if isinstance(_cam3_shape[3], int) else images[0].shape[-1]
+                pad_img = torch.full(
+                    (images[0].shape[0], images[0].shape[1], _cam3_h, _cam3_w),
+                    -1.0, dtype=images[0].dtype, device=images[0].device,
+                )
+            else:
+                pad_img = torch.ones_like(images[0]) * -1.0
+            images.append(pad_img)
             img_masks.append(torch.zeros_like(img_masks[0]))
         state = policy.prepare_state(batch_pp)
         lang_tokens = batch_pp[OBS_LANGUAGE_TOKENS]
