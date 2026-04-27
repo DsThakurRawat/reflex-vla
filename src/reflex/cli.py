@@ -19,9 +19,24 @@ from reflex.config import ExportConfig, get_hardware_profile, HARDWARE_PROFILES
 app = typer.Typer(
     name="reflex",
     help="Deploy any VLA model to any edge hardware. One command.",
-    no_args_is_help=True,
+    no_args_is_help=False,  # we render our own action-first summary in main()
 )
 console = Console()
+
+
+_NOARGS_SUMMARY = """[bold]reflex[/bold] — deploy any VLA model to any edge hardware.
+
+[bold cyan]Most-used:[/bold cyan]
+  [green]reflex chat[/green]                start the natural-language assistant
+  [green]reflex chat --tui[/green]          ↳ full-screen TUI (needs [dim]pip install 'reflex-vla\\[tui]'[/dim])
+  [green]reflex go --model X[/green]        one-command deploy: probe → pull → export → serve
+  [green]reflex doctor[/green]              diagnose install + GPU issues
+  [green]reflex models list[/green]         browse the curated model registry
+
+[dim]All commands:[/dim]  reflex --help
+[dim]Examples:[/dim]      https://github.com/rylinjames/reflex-vla/tree/main/examples
+[dim]Docs:[/dim]          https://fastcrest.com  ·  https://pypi.org/project/reflex-vla/
+"""
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -39,8 +54,9 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     version: bool = typer.Option(
         None, "--version", help="Show version and exit",
         callback=_version_callback, is_eager=True,
@@ -53,6 +69,12 @@ def main(
         maybe_nag(__version__)
     except Exception:  # noqa: BLE001
         pass  # never block the CLI on a network/cache hiccup
+
+    # No subcommand → show the curated action-first summary (not typer's
+    # alphabetical command dump). Beats burying `chat` and `go` for new users.
+    if ctx.invoked_subcommand is None:
+        console.print(_NOARGS_SUMMARY)
+        raise typer.Exit()
 
 
 @app.command(hidden=True)
@@ -3294,6 +3316,10 @@ def chat(
              "Requires `pip install 'reflex-vla[tui]'`. Falls back to the Rich REPL if "
              "textual isn't installed.",
     ),
+    resume: bool = typer.Option(
+        False, "--resume",
+        help="Resume the most-recent saved chat session from ~/.cache/reflex/chat_history/.",
+    ),
 ) -> None:
     """Natural-language chat that can run reflex commands for you."""
     if tui:
@@ -3301,7 +3327,7 @@ def chat(
         run_tui(proxy_url=proxy_url, dry_run=dry_run)
     else:
         from reflex.chat.console import run_repl
-        run_repl(proxy_url=proxy_url, dry_run=dry_run, no_stream=no_stream)
+        run_repl(proxy_url=proxy_url, dry_run=dry_run, no_stream=no_stream, resume=resume)
 
 
 config_app = typer.Typer(name="config", help="Show + manage reflex configuration.", no_args_is_help=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -64,7 +65,66 @@ def _make_event_handler(ui: _UIState):
     return handler
 
 
-def run_repl(proxy_url: str | None = None, dry_run: bool = False, no_stream: bool = False) -> None:
+def _format_history(messages: list[dict[str, Any]]) -> str:
+    lines: list[str] = ["[bold]Conversation so far[/bold]\n"]
+    for m in messages:
+        role = m.get("role", "?")
+        if role == "system":
+            continue  # too long + always the same; skip
+        if role == "tool":
+            preview = (m.get("content") or "")[:100].replace("\n", " ")
+            lines.append(f"  [yellow]tool[/yellow]  {preview}")
+            continue
+        content = m.get("content") or ""
+        if not content and m.get("tool_calls"):
+            names = ", ".join(tc["function"]["name"] for tc in m["tool_calls"])
+            lines.append(f"  [cyan]bot[/cyan]   → {names}")
+        else:
+            tag = "you" if role == "user" else "bot"
+            color = "green" if role == "user" else "white"
+            preview = content[:200].replace("\n", " ")
+            lines.append(f"  [{color}]{tag}[/{color}]   {preview}")
+    return "\n".join(lines)
+
+
+def _handle_slash(cmd: str, state: LoopState) -> bool:
+    """Return True if the command was handled (REPL should continue without LLM)."""
+    from reflex.chat.welcome import SLASH_HELP, TOUR_BLOCK, tools_listing
+    cmd = cmd.lower().strip()
+    if cmd in {"/help", "/?"}:
+        console.print(SLASH_HELP)
+        return True
+    if cmd == "/tools":
+        console.print(tools_listing())
+        return True
+    if cmd == "/history":
+        console.print(_format_history(state.messages))
+        return True
+    if cmd == "/clear":
+        console.clear()
+        return True
+    if cmd == "/reset":
+        state.reset()
+        console.print("[dim]conversation cleared[/dim]")
+        return True
+    if cmd == "/tour":
+        console.print(TOUR_BLOCK)
+        return True
+    return False
+
+
+def run_repl(
+    proxy_url: str | None = None,
+    dry_run: bool = False,
+    no_stream: bool = False,
+    resume: bool = False,
+) -> None:
+    from reflex.chat.welcome import (
+        WELCOME_CARD, SHORT_BANNER,
+        has_been_welcomed, mark_welcomed,
+    )
+    from reflex.chat.history import latest_session_path, load_session, new_session_path
+
     backend = ChatBackend(proxy_url=proxy_url) if proxy_url else ChatBackend()
     try:
         h = backend.health()
@@ -79,22 +139,48 @@ def run_repl(proxy_url: str | None = None, dry_run: bool = False, no_stream: boo
         dry_run=dry_run,
         streaming=not no_stream,
     )
-    state.reset()
-    console.print("[bold]reflex chat[/bold] — Ctrl+C or 'exit' to quit. /reset to clear.\n")
+
+    if resume:
+        prev = latest_session_path()
+        if prev is None:
+            console.print("[yellow]no previous chat session found; starting fresh[/yellow]")
+            state.reset()
+        else:
+            try:
+                state.messages = load_session(prev)
+                console.print(f"[dim]resumed session: {prev.name} ({len(state.messages)} messages)[/dim]")
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[yellow]could not resume {prev.name} ({e}); starting fresh[/yellow]")
+                state.reset()
+    else:
+        state.reset()
+
+    if not has_been_welcomed():
+        console.print()
+        console.print(WELCOME_CARD)
+        mark_welcomed()
+    else:
+        console.print(SHORT_BANNER)
+
+    # Auto-save this session as it grows (one file per session).
+    session_path = new_session_path()
 
     while True:
         try:
             user = console.input("[bold green]you ›[/bold green] ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\nbye")
+            _save_session(session_path, state.messages)
             return
         if not user:
             continue
         if user.lower() in {"exit", "quit", ":q"}:
+            _save_session(session_path, state.messages)
             return
-        if user.lower() == "/reset":
-            state.reset()
-            console.print("[dim]conversation cleared[/dim]")
+        if user.startswith("/"):
+            if _handle_slash(user, state):
+                continue
+            console.print(f"[yellow]unknown command: {user}[/yellow]  (try /help)")
             continue
 
         try:
@@ -114,3 +200,14 @@ def run_repl(proxy_url: str | None = None, dry_run: bool = False, no_stream: boo
             console.print()
             console.print(reply or "_(empty reply)_")
             console.print()
+
+        # Persist after every turn so a Ctrl+C never loses context.
+        _save_session(session_path, state.messages)
+
+
+def _save_session(path: "Path", messages: list[dict[str, Any]]) -> None:
+    from reflex.chat.history import save_session
+    try:
+        save_session(path, messages)
+    except Exception:  # noqa: BLE001
+        pass  # not load-bearing — never crash the REPL on a disk hiccup

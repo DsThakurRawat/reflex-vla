@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4.1 — 2026-04-27
+
+UX onboarding pass — discoverability + persistence + the missing one-command tool.
+
+### Added
+- **First-run welcome card in `reflex chat`** — shown once per machine (cached in `$REFLEX_HOME/.welcomed`), explains what the assistant can do, lists slash commands, suggests starter prompts. Blank-prompt-paralysis is dead.
+- **Slash commands**: `/help`, `/tools`, `/history`, `/clear`, `/reset`, `/tour`. `/tools` lists all 17 tools grouped by category (Deploy / Models / Train / Inspect / Status). `/history` shows the conversation so far. `/tour` shows 5 example prompts to copy-paste.
+- **Conversation persistence** — every chat session auto-saves to `$REFLEX_HOME/chat_history/session-YYYYMMDD-HHMMSS.jsonl` after each turn. New CLI flag: `reflex chat --resume` loads the most recent session so Ctrl+C never loses context.
+- **`deploy_one_command` chat tool** wrapping `reflex go`. The chat agent can now do "deploy smolvla to my mac" as a single tool call instead of manually chaining 4 tools (probe → pull → export → serve). Closes the audit gap where the headline command wasn't in chat.
+
+### Changed
+- **`reflex` (no args) shows a curated action-first summary** instead of typer's alphabetical command dump. Leads with `chat` and `go` — the two commands 90% of users want — followed by `doctor` and `models list`. Full alphabetical list still available via `reflex --help`.
+
+### Notes
+- Total chat tools is now **17** (was 16). Regression test updated.
+- 47/47 tests pass.
+
 ## v0.4.0 — 2026-04-27
 
 Polish release — bundles five small wins + one new optional surface.

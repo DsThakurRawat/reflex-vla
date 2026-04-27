@@ -28,7 +28,23 @@ def _tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, 
     }
 
 
+_DEVICE_CLASSES = ["orin_nano", "agx_orin", "thor", "h200", "h100", "a100", "a10g", "cpu"]
+
+
 TOOLS: list[dict[str, Any]] = [
+    _tool(
+        "deploy_one_command",
+        "One-command deploy: probe hardware → pick model variant → pull weights → export to ONNX → start the inference server. The `reflex go` workflow. PREFER THIS over manually chaining pull_model + export_model + serve_model when the user just wants 'deploy X'. The export step requires the [monolithic] extras.",
+        {
+            "properties": {
+                "model": {"type": "string", "description": "Registry id (e.g. 'smolvla-base', 'pi05-libero') or family name ('pi05'/'smolvla'/'pi0')"},
+                "device_class": {"type": "string", "enum": _DEVICE_CLASSES, "description": "Override hardware probe. Use when probe misclassifies."},
+                "embodiment": {"type": "string", "description": "Robot preset (franka/so100/ur5). Optional but recommended — cross-checks dataset/action shapes."},
+                "port": {"type": "integer", "description": "HTTP port for /act + /health (default 8000)"},
+            },
+            "required": ["model"],
+        },
+    ),
     _tool(
         "export_model",
         "Export a HuggingFace VLA model (pi0, pi0.5, SmolVLA, GR00T) to ONNX for a target hardware tier. Returns the export directory path.",

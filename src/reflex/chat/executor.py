@@ -46,6 +46,14 @@ def _flag(args: list[str], key: str, value: Any) -> None:
     args.extend([f"--{key}", str(value)])
 
 
+def _build_go(p: dict[str, Any]) -> list[str]:
+    args = ["go", "--model", str(p["model"])]
+    _flag(args, "device-class", p.get("device_class"))
+    _flag(args, "embodiment", p.get("embodiment"))
+    _flag(args, "port", p.get("port"))
+    return args
+
+
 def _build_export(p: dict[str, Any]) -> list[str]:
     args = ["export", str(p["model"]), "--target", str(p["target"])]
     _flag(args, "output", p.get("output"))
@@ -122,6 +130,7 @@ _STATIC = {
 }
 
 _BUILDERS = {
+    "deploy_one_command": _build_go,
     "export_model": _build_export,
     "serve_model": _build_serve,
     "benchmark": _build_bench,
