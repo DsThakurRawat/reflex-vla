@@ -295,8 +295,14 @@ Apache 2.0
 
 ## Status
 
-**v0.3 — `reflex chat` ships.** Active development. Install, kick the tires, open issues loudly. We're looking for the first 20 robotics teams actually deploying this; your feedback shapes v0.4.
+**v0.5 — source-available under BSL 1.1.** Active development. Install, kick the tires, open issues loudly. We're looking for the first 20 robotics teams actually deploying this; your feedback shapes v0.6.
+
+## License
+
+Source-available under the [Business Source License 1.1](LICENSE) — same model HashiCorp, MongoDB, Sentry, Cockroach, and Couchbase use. Free for any non-competitive use (personal, commercial, internal); restricts only competing hosted/embedded offerings. Auto-converts to Apache 2.0 in 4 years.
+
+For commercial licensing inquiries (offering Reflex as a hosted service to compete with FastCrest, OEM/embedded use, etc.): hello@fastcrest.com
 
 ---
 
-Reflex is built by [FastCrest](https://fastcrest.com). Apache 2.0, no signup, no telemetry by default.
+Reflex is built by [FastCrest](https://fastcrest.com). No signup, no telemetry by default.

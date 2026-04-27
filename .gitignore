@@ -23,3 +23,9 @@ reference/ray/
 reference/trtllm/
 reference/lerobot/
 reference/openpi/
+
+# Editor-agent session logs (never commit — were leaked to public repo in Apr 2026)
+.agents/
+
+# License backup from BSL switch
+LICENSE.apache.bak
