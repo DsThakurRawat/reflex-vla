@@ -129,18 +129,19 @@ ok "Python $PY_VER (>=3.10 required)"
 # -- Pick install extras based on detected platform ---------------------------
 if [ -z "$EXTRAS" ]; then
   if [ "$IS_ORIN" -eq 1 ]; then
-    EXTRAS="serve,gpu"
-    ok "Detected Jetson Orin → installing with [serve,gpu]"
+    EXTRAS="serve,gpu,monolithic"
+    ok "Detected Jetson Orin → installing with [serve,gpu,monolithic]"
   elif [ "$OS" = "Darwin" ]; then
-    EXTRAS="serve,onnx"
-    ok "Detected macOS → installing with [serve,onnx] (CPU runtime)"
+    EXTRAS="serve,onnx,monolithic"
+    ok "Detected macOS → installing with [serve,onnx,monolithic] (CPU runtime)"
   elif command -v nvidia-smi >/dev/null 2>&1; then
-    EXTRAS="serve,gpu"
-    ok "Detected NVIDIA GPU → installing with [serve,gpu]"
+    EXTRAS="serve,gpu,monolithic"
+    ok "Detected NVIDIA GPU → installing with [serve,gpu,monolithic]"
   else
-    EXTRAS="serve,onnx"
-    ok "No GPU detected → installing with [serve,onnx] (CPU runtime)"
+    EXTRAS="serve,onnx,monolithic"
+    ok "No GPU detected → installing with [serve,onnx,monolithic] (CPU runtime)"
   fi
+  note "  (monolithic adds the extras 'reflex go' needs to actually deploy a model — not just chat)"
 fi
 echo
 
