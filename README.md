@@ -266,6 +266,23 @@ The response JSON surfaces telemetry from each enabled wedge so you can see what
 
 `reflex inspect targets` lists current profiles.
 
+### Supported GPU architectures
+
+| Architecture | Compute | Status | Notes |
+|---|---|---|---|
+| Ampere (RTX 30-series, A10G, A100) | sm_8.0–8.6 | ✅ Supported | Tested on Modal A10G + A100, RTX 4090 |
+| Ada Lovelace (RTX 40-series, L4) | sm_8.9 | ✅ Supported | |
+| Hopper (H100, H200) | sm_9.0 | ✅ Supported | |
+| Jetson Orin (Orin Nano / NX / AGX) | sm_8.7 | ✅ Supported | JetPack 5.x or 6.x |
+| Jetson Thor | sm_10.x | ⚠️ Untested | Should work — same Blackwell silicon as desktop, but ORT-bundled CUDA EP needs Blackwell support (see below) |
+| **Blackwell desktop (RTX 5090, RTX PRO 6000, B200, GB200)** | **sm_10.0** | **❌ Not yet supported** | ORT's bundled cuBLAS/cuDNN don't ship sm_100 kernels. Server segfaults at `InferenceSession` init. **Workaround:** use `reflex chat` (no GPU needed), or `/act` testing on Modal cloud or non-Blackwell GPU until ORT updates ship. Tracking: [microsoft/onnxruntime#blackwell](https://github.com/microsoft/onnxruntime/issues) |
+| Older NVIDIA (Turing RTX 20, GTX 16) | sm_7.5 | ⚠️ Best-effort | Should work but not in CI matrix |
+| Pre-Tensor-Core (Maxwell Jetson Nano 4GB, GTX 9-series) | sm_5.x | ❌ Not supported | NVIDIA EOL'd this hardware at JetPack 4.6 (Python 3.6) — too old for modern ML stacks regardless. The bootstrap installer auto-detects and bails fast with redirect instructions. |
+
+**For Blackwell users right now:** the bootstrap installer accepts your hardware and the package installs cleanly, but `reflex go` will segfault at server startup. The real fix requires ORT to ship Blackwell-aware bundled binaries (no published timeline). Workarounds: chat-only mode (no GPU needed), `reflex doctor`, `reflex models list` all work fine. `/act` and TRT-engine inference need a non-Blackwell GPU temporarily.
+
+A Blackwell-specific runtime path via TensorRT-LLM (which DOES support sm_100) is planned for v0.7+ — see [reflex_context ADR queue](https://github.com/rylinjames/reflex-vla/issues).
+
 ## Composable runtime wedges
 
 Each wedge is a flag on `reflex serve` (also flowed through `reflex go`):
