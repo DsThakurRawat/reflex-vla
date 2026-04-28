@@ -15,15 +15,23 @@ One CLI, seven verbs, plus a chat agent.
 
 ## Install
 
-```bash
-pip install reflex-vla
-```
-
-For GPU serving + monolithic export (production path):
+**Recommended** — runs hardware + Python checks first, picks the right install extras for your machine:
 
 ```bash
-pip install 'reflex-vla[serve,gpu,monolithic]'
+curl -sSf https://raw.githubusercontent.com/rylinjames/reflex-vla/main/install.sh | sh
 ```
+
+The bootstrap installer detects your platform (Mac / Jetson Orin / NVIDIA GPU / CPU) and chooses the right extras automatically. It also bails early with a useful message on unsupported hardware (e.g. original 4 GB Jetson Nano — Maxwell GPU + JetPack 4.6 / Python 3.6, too old for VLAs).
+
+**Manual install** if you know what you want:
+
+```bash
+pip install reflex-vla                            # core
+pip install 'reflex-vla[serve,gpu,monolithic]'    # GPU production path
+pip install 'reflex-vla[serve,onnx]'              # Mac / CPU runtime
+```
+
+Requires Python ≥ 3.10.
 
 ## Quickstart — chat to it
 
