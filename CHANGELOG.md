@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.5.4 — 2026-04-28
+
+Real fixes for the four UX issues surfaced by the first-tester debugging session.
+
+### Added
+- **Pre-startup model load logging + loud failure on lifespan crash.** Before v0.5.4, if `server.load()` raised an exception during FastAPI's lifespan startup, uvicorn swallowed the exception and the user saw "Waiting for application startup." followed by silent process death. Now we wrap `server.load()`, print a full traceback to stderr with a clear "FATAL: model load failed" banner, list the three most common causes (stale cache / ORT-TRT mismatch / GPU OOM) with concrete fixes, then re-raise so uvicorn exits non-zero. Added "Loading model from ..." phase log so users can see what's happening during the 10-60s cold start.
+- **Export cache version pinning + auto-invalidation.** `reflex go` now writes `_reflex_meta.json` alongside `VERIFICATION.md` with the reflex version, model_id, export_target, export_mode, and timestamp. On cache hit, validates: (1) version matches current package, (2) target matches what we'd build for current hardware. Mismatches → loud `⚠ Cache stale` message + automatic `rm -rf` of the cache dir + rebuild. Legacy caches (no `_reflex_meta.json`, built by ≤0.5.3) are also rebuilt automatically. No more silent stale-cache server crashes.
+
+### Fixed
+- **`__version__` in `reflex/__init__.py` was stale.** Pinned to `0.5.0` since launch despite shipping v0.5.0 → v0.5.3. Now matches `pyproject.toml`. The cache versioning fix above relies on `__version__` being correct.
+- **Bundled embodiment presets used fractional `rtc_execution_horizon`** (`0.5` for franka/ur5, `0.4` for so100), triggering a deprecation warning at every `reflex go` startup since v0.5.2. Converted to integer counts: franka/ur5 → `25` (0.5 × chunk_size 50), so100 → `12` (0.4 × chunk_size 30). Schema v2 will reject fractionals.
+
+### Documentation
+- **README "Upgrading" section.** Calls out `pip install --upgrade reflex-vla` and `uv add --refresh reflex-vla` (uv caches the package index aggressively and won't see new releases without `--refresh` — caught when the first tester couldn't pull v0.5.3 right after release). Documents the manual cache-clear escape hatch for users still on ≤0.5.3 caches.
+
+### Notes
+- All four bugs caught from the same first-tester (Rob, RTX 5090, Arch Linux) debugging session that spanned roughly 90 minutes from public install URL going live → v0.5.4 ship.
+- Total v0.5.x velocity: 5 patch releases in 6 hours, all driven by real first-user feedback.
+
 ## v0.5.3 — 2026-04-28
 
 Quickstart polish — README + embodiment error message.

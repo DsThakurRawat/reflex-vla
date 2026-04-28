@@ -3086,8 +3086,51 @@ def go(
         reflex_home = Path(os.environ.get("REFLEX_HOME", Path.home() / ".cache" / "reflex"))
         export_dir = reflex_home / "exports" / entry.model_id
         export_marker = export_dir / "VERIFICATION.md"
+        meta_marker = export_dir / "_reflex_meta.json"
 
+        # Validate cache: VERIFICATION.md presence + version-pinned _reflex_meta.json.
+        # Stale caches (built by older reflex versions, mismatched export target, or
+        # incomplete writes) are silently corrupting if reused — auto-invalidate
+        # rather than letting the server crash mysteriously at startup.
+        cache_valid = False
         if export_marker.exists():
+            try:
+                from reflex import __version__ as _current_reflex_version
+            except Exception:  # noqa: BLE001
+                _current_reflex_version = "unknown"
+            if meta_marker.exists():
+                try:
+                    import json as _json_cache
+                    meta = _json_cache.loads(meta_marker.read_text())
+                    cached_version = meta.get("reflex_version", "?")
+                    cached_target = meta.get("export_target", "?")
+                    if cached_version != _current_reflex_version:
+                        console.print(
+                            f"[yellow]⚠ Cache stale[/yellow]: built by reflex {cached_version}, "
+                            f"you're on {_current_reflex_version}. Rebuilding."
+                        )
+                    elif cached_target != export_target:
+                        console.print(
+                            f"[yellow]⚠ Cache target mismatch[/yellow]: built for "
+                            f"{cached_target}, you need {export_target}. Rebuilding."
+                        )
+                    else:
+                        cache_valid = True
+                except Exception as _exc:  # noqa: BLE001
+                    console.print(
+                        f"[yellow]⚠ Cache metadata unreadable ({_exc.__class__.__name__})[/yellow]: "
+                        f"rebuilding to be safe."
+                    )
+            else:
+                console.print(
+                    f"[yellow]⚠ Legacy cache detected[/yellow] (no version metadata, "
+                    f"likely built by reflex ≤0.5.3). Rebuilding."
+                )
+            if not cache_valid:
+                import shutil as _shutil_cache
+                _shutil_cache.rmtree(export_dir, ignore_errors=True)
+
+        if cache_valid:
             console.print(f"[bold cyan]export hit:[/bold cyan] {export_dir} already populated; skipping export.")
         else:
             console.print(
@@ -3126,6 +3169,25 @@ def go(
                 write_verification_report(str(export_dir), parity=None)
             except Exception:  # noqa: BLE001
                 pass  # Verification manifest is informational, not load-bearing
+
+            # Write the version-pinned cache marker so future runs can detect
+            # stale caches and rebuild instead of silently using mismatched bytes.
+            try:
+                import json as _json_meta
+                from reflex import __version__ as _current_reflex_version
+                from datetime import datetime as _dt
+                meta = {
+                    "reflex_version": _current_reflex_version,
+                    "model_id": entry.model_id,
+                    "export_target": export_target,
+                    "export_mode": "monolithic",
+                    "completed_at": _dt.utcnow().isoformat() + "Z",
+                }
+                (export_dir / "_reflex_meta.json").write_text(
+                    _json_meta.dumps(meta, indent=2)
+                )
+            except Exception:  # noqa: BLE001
+                pass  # Cache marker is best-effort; legacy fallback handles missing meta
 
         # Hand off serve to the exported dir, not the raw weights dir.
         target = export_dir

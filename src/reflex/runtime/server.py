@@ -1505,7 +1505,41 @@ def create_app(
                 ec.control["frequency_hz"], ec.control["chunk_size"],
             )
         server.health_state = "loading"  # type: ignore[attr-defined]
-        server.load()
+        # Phase logging + loud failure: if server.load() throws, print a
+        # full traceback to stderr (uvicorn swallows lifespan exceptions
+        # by default, leaving users staring at "Waiting for application
+        # startup." with no clue what crashed) and re-raise so uvicorn
+        # exits non-zero. Caught from a real first-tester debugging
+        # session where a stale export cache caused a silent startup
+        # death — see CHANGELOG v0.5.4.
+        logger.warning(
+            "Loading model from %s ... (ONNX session + TRT engine init "
+            "can take 10-60s on first-cold-start; subsequent runs reuse "
+            "the cached engine)",
+            getattr(server, "export_dir", "?"),
+        )
+        try:
+            server.load()
+        except Exception as load_exc:  # noqa: BLE001
+            import sys as _sys_load
+            import traceback as _tb_load
+            logger.error("=" * 70)
+            logger.error("FATAL: model load failed during FastAPI startup.")
+            logger.error("Export dir: %s", getattr(server, "export_dir", "?"))
+            logger.error("Exception: %s: %s", type(load_exc).__name__, load_exc)
+            logger.error("-" * 70)
+            _tb_load.print_exc(file=_sys_load.stderr)
+            logger.error("-" * 70)
+            logger.error(
+                "Common causes: (1) stale export cache — try "
+                "'rm -rf ~/.cache/reflex/exports/<model_id>' and re-run "
+                "reflex go; (2) ONNX/TensorRT runtime version mismatch — "
+                "try pip install --upgrade onnxruntime-gpu; (3) GPU "
+                "out-of-memory — close other GPU processes and retry."
+            )
+            logger.error("=" * 70)
+            raise
+        logger.info("Model loaded successfully.")
         # Only configure replan buffering after load() so chunk_size is known.
         if replan_hz is not None and execute_hz is not None and hasattr(
             server, "configure_replan"

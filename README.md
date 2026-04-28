@@ -33,6 +33,27 @@ pip install 'reflex-vla[serve,onnx]'              # Mac / CPU runtime
 
 Requires Python ≥ 3.10.
 
+### Upgrading
+
+We ship patches frequently — make sure you're on the latest:
+
+```bash
+pip install --upgrade reflex-vla              # pip
+uv add --refresh reflex-vla                   # uv (the --refresh flag is required;
+                                              # uv caches the package index aggressively
+                                              # and won't see new releases without it)
+```
+
+After upgrading, if you've previously run `reflex go` and the server fails to start, your
+export cache may be stale (built by an older version, schema mismatch, etc.):
+
+```bash
+rm -rf ~/.cache/reflex/exports/<model_id>     # forces a fresh export on next reflex go
+```
+
+v0.5.4+ does this automatically when it detects a version mismatch — the manual step is
+only needed for caches built by v0.5.3 or earlier.
+
 ## Quickstart — chat to it
 
 ```bash
