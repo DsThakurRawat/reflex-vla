@@ -20,34 +20,26 @@ __all__ = [
 # ORT-TRT EP needs libnvinfer.so.10 (from the `tensorrt` pip pkg) + CUDA libs
 # (libcublas, libcudnn) loadable at session-create time. The pip-installed
 # nvidia/tensorrt libs live under site-packages but Linux's dynamic loader
-# doesn't know to look there. Without LD_LIBRARY_PATH set, ORT-TRT EP fails
-# to load and ORT silently falls back to CUDA EP — losing the 5.55× perf win
-# measured 2026-04-29 (Modal A10G, SmolVLA monolithic).
+# doesn't know to look there. Without these libs findable at runtime,
+# ORT-TRT EP fails to load and ORT silently falls back to CUDA EP — losing
+# the 5.55× perf win measured 2026-04-29 (Modal A10G, SmolVLA monolithic).
 #
-# We auto-prepend the right paths at import time. Idempotent (won't re-add if
-# already present). No-op on macOS/Windows or when the paths don't exist.
+# Two-part fix at import time:
+#   (1) Set LD_LIBRARY_PATH so any child subprocess inherits the right paths
+#   (2) eagerly dlopen libnvinfer/libcublas/libcudnn with RTLD_GLOBAL so the
+#       symbols are visible to ORT's later C++ dlopen — modifying
+#       LD_LIBRARY_PATH after process start does NOT update the dynamic
+#       loader for the current process, so (2) is the load-bearing piece.
+#
+# Both are idempotent. No-op on macOS/Windows or when the paths don't exist.
 # Opt out via REFLEX_NO_LD_LIBRARY_PATH_PATCH=1.
 #
 # Per ADR 2026-04-29-ort-trt-ep-first-class-support.md.
-def _patch_ld_library_path() -> None:
-    """Prepend pip-installed nvidia/tensorrt lib dirs to LD_LIBRARY_PATH.
-
-    Runs at module load (NOT lazy) so it takes effect before any other
-    import triggers CUDA / ORT initialization. Returns silently on macOS,
-    Windows, or when no paths exist.
-    """
-    import os
+def _candidate_lib_dirs():
+    """Return the list of pip-installed nvidia/tensorrt lib dirs to consider."""
     import sys
 
-    if os.environ.get("REFLEX_NO_LD_LIBRARY_PATH_PATCH"):
-        return
-    if sys.platform not in ("linux", "linux2"):
-        return
-
     py_lib = f"python{sys.version_info.major}.{sys.version_info.minor}"
-
-    # Candidate lib dirs from pip-installed nvidia/* + tensorrt pkgs.
-    # Ordered so libnvinfer (TRT EP's runtime dep) is found first.
     candidates = []
     for base in (sys.prefix, "/usr/local"):
         candidates.extend([
@@ -59,12 +51,29 @@ def _patch_ld_library_path() -> None:
             f"{base}/lib/{py_lib}/site-packages/nvidia/cuda_nvrtc/lib",
             f"{base}/lib/{py_lib}/site-packages/nvidia/nccl/lib",
         ])
+    return candidates
+
+
+def _patch_ld_library_path() -> None:
+    """Prepend pip-installed nvidia/tensorrt lib dirs to LD_LIBRARY_PATH.
+
+    Helps SUBPROCESSES inherit the right loader paths. Does NOT affect the
+    current process's dynamic loader — see _eager_dlopen_nvidia_libs() for
+    that. Returns silently on macOS, Windows, or when no paths exist.
+    """
+    import os
+    import sys
+
+    if os.environ.get("REFLEX_NO_LD_LIBRARY_PATH_PATCH"):
+        return
+    if sys.platform not in ("linux", "linux2"):
+        return
 
     existing = os.environ.get("LD_LIBRARY_PATH", "")
     existing_parts = [p for p in existing.split(os.pathsep) if p]
 
     to_prepend = []
-    for path in candidates:
+    for path in _candidate_lib_dirs():
         if not os.path.isdir(path):
             continue
         if path in existing_parts or path in to_prepend:
@@ -78,7 +87,62 @@ def _patch_ld_library_path() -> None:
     os.environ["LD_LIBRARY_PATH"] = new_value
 
 
+def _eager_dlopen_nvidia_libs() -> None:
+    """dlopen libnvinfer/libcublas/libcudnn into the current process w/ RTLD_GLOBAL.
+
+    THIS is the load-bearing piece. Modifying LD_LIBRARY_PATH after process
+    start does NOT affect the dynamic loader for this process — it only
+    helps SUBPROCESSES. So we explicitly resolve full paths to the pip-
+    installed shared objects and dlopen them with RTLD_GLOBAL, which makes
+    the symbols visible to subsequent dlopen calls (including from ORT's
+    C++ TRT EP layer when a session is created later).
+
+    Idempotent — ctypes.CDLL with the same path twice just returns the
+    cached handle. No-op on macOS/Windows or when libs don't exist.
+    """
+    import ctypes
+    import glob
+    import os
+    import sys
+
+    if os.environ.get("REFLEX_NO_LD_LIBRARY_PATH_PATCH"):
+        return
+    if sys.platform not in ("linux", "linux2"):
+        return
+
+    # Map of libname pattern → list of candidate .so files we'll search for.
+    # The libs are loaded in dependency order (cuBLAS/cuDNN first, then the
+    # higher-level TensorRT runtime that depends on them).
+    # Order matters: deps first (cuda runtime + blas + cudnn), then TensorRT
+    # core, then TensorRT plugin/parser libs that ORT's
+    # libonnxruntime_providers_tensorrt.so needs at session-create time.
+    # Caught 2026-04-29 — Modal A10G validation showed even after libnvinfer
+    # loaded, ORT's TRT EP still failed because libnvonnxparser.so.10 wasn't
+    # loaded yet.
+    targets = [
+        "libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12",
+        "libcudnn.so.9",
+        "libnvinfer.so.10",
+        "libnvinfer_plugin.so.10",
+        "libnvonnxparser.so.10",
+        "libnvinfer_dispatch.so.10",
+        "libnvinfer_lean.so.10",
+    ]
+
+    for libname in targets:
+        # Try to find the lib in any of our candidate dirs
+        for libdir in _candidate_lib_dirs():
+            full_path = os.path.join(libdir, libname)
+            if os.path.exists(full_path):
+                try:
+                    ctypes.CDLL(full_path, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass  # best-effort; will surface in reflex doctor
+                break  # found it; move to next lib
+
+
 _patch_ld_library_path()
+_eager_dlopen_nvidia_libs()
 
 
 def __getattr__(name: str):

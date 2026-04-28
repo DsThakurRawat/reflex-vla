@@ -2385,28 +2385,56 @@ def _check_trt_ep_load_chain(add) -> None:
     2026-04-29-ort-trt-ep-first-class-support.md.
     """
     import ctypes
+    import os
 
-    # Check 1-3: shared library loadability via ctypes.CDLL
+    # Check 1-3: shared library loadability. Resolve full paths from the
+    # candidate dirs (same logic as reflex/__init__.py:_candidate_lib_dirs)
+    # because bare `ctypes.CDLL("libnvinfer.so.10")` only works if the
+    # dynamic loader's path includes the lib dir — and modifying
+    # LD_LIBRARY_PATH after process start does NOT update the loader.
+    # The reflex import already eagerly dlopen's these libs with RTLD_GLOBAL;
+    # we re-do the lookup here to surface the per-lib status to the user.
+    from reflex import _candidate_lib_dirs
+
+    def _find_lib(libname: str) -> str | None:
+        for libdir in _candidate_lib_dirs():
+            full = os.path.join(libdir, libname)
+            if os.path.exists(full):
+                return full
+        return None
+
+    # Use \[ to escape Rich markup brackets so they render as literal text
+    # in the doctor table.
     libs = [
         ("libnvinfer.so.10", "TensorRT runtime",
-         "pip install 'reflex-vla[serve,gpu]' (brings tensorrt>=10)"),
+         r"pip install 'reflex-vla\[serve,gpu]' (brings tensorrt>=10)"),
         ("libcublas.so.12", "CUDA cuBLAS",
-         "pip install nvidia-cublas-cu12 (auto-included in [serve,gpu])"),
+         r"pip install nvidia-cublas-cu12 (auto-included in \[serve,gpu])"),
         ("libcudnn.so.9", "CUDA cuDNN",
-         "pip install nvidia-cudnn-cu12 (auto-included in [serve,gpu])"),
+         r"pip install nvidia-cudnn-cu12 (auto-included in \[serve,gpu])"),
     ]
     all_libs_loadable = True
     for libname, friendly, fix_hint in libs:
+        full_path = _find_lib(libname)
+        if full_path is None:
+            all_libs_loadable = False
+            add(
+                f"{friendly} ({libname})",
+                False,
+                f"NOT installed (not found in pip site-packages). "
+                f"Fix: {fix_hint}",
+            )
+            continue
         try:
-            ctypes.CDLL(libname)
-            add(f"{friendly} ({libname})", True, "loadable")
+            ctypes.CDLL(full_path, mode=ctypes.RTLD_GLOBAL)
+            add(f"{friendly} ({libname})", True, f"loadable at {full_path}")
         except OSError as exc:
             all_libs_loadable = False
             add(
                 f"{friendly} ({libname})",
                 False,
-                f"NOT loadable — ORT-TRT EP will silently fall back to "
-                f"ORT-CUDA EP (~5x slower). Fix: {fix_hint}",
+                f"installed at {full_path} but not loadable: {exc}. "
+                f"Fix: {fix_hint}",
             )
 
     # Check 4: gold standard — actually create an ORT session with TRT EP

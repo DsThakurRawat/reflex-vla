@@ -61,13 +61,11 @@ def _result_for(calls, name_substring):
 
 
 def test_all_libs_loadable_runs_full_chain(add_capture):
-    """Happy path: libnvinfer + libcublas + libcudnn all load → session check runs."""
+    """Happy path: libnvinfer + libcublas + libcudnn all found + load → session check runs."""
     calls, fake_add = add_capture
 
-    # CDLL succeeds for all libs
     fake_cdll = MagicMock(return_value=MagicMock())
 
-    # ORT session with TRT EP succeeds + TRT EP active
     fake_session = MagicMock()
     fake_session.get_providers.return_value = [
         "TensorrtExecutionProvider", "CPUExecutionProvider"
@@ -80,6 +78,7 @@ def test_all_libs_loadable_runs_full_chain(add_capture):
 
     with (
         patch("ctypes.CDLL", fake_cdll),
+        patch("os.path.exists", return_value=True),  # all libs "found" in candidate dirs
         patch.dict("sys.modules", {"onnxruntime": fake_ort, "onnx": _fake_onnx_module()}),
     ):
         _check_trt_ep_load_chain(fake_add)
@@ -91,20 +90,22 @@ def test_all_libs_loadable_runs_full_chain(add_capture):
 
 
 def test_libnvinfer_missing_skips_session_check(add_capture):
-    """If libnvinfer fails to load, mark it ✗ + skip the session check (would be uninformative)."""
+    """If libnvinfer doesn't exist in candidate dirs, mark ✗ + skip session check."""
     calls, fake_add = add_capture
 
-    def cdll_side_effect(libname):
-        if "libnvinfer" in libname:
-            raise OSError("cannot open shared object file")
-        return MagicMock()
+    # libnvinfer is NOT found anywhere; libcublas + libcudnn ARE found
+    def exists_side_effect(path):
+        return "libnvinfer" not in path
 
-    with patch("ctypes.CDLL", side_effect=cdll_side_effect):
+    with (
+        patch("ctypes.CDLL", return_value=MagicMock()),
+        patch("os.path.exists", side_effect=exists_side_effect),
+    ):
         _check_trt_ep_load_chain(fake_add)
 
     nvinfer = _result_for(calls, "libnvinfer.so.10")
     assert nvinfer["ok"] is False
-    assert "NOT loadable" in nvinfer["detail"]
+    assert "NOT installed" in nvinfer["detail"]
     assert "pip install" in nvinfer["detail"]  # remediation hint present
 
     session = _result_for(calls, "ORT-TRT EP active")
@@ -116,7 +117,10 @@ def test_remediation_hints_present_for_each_lib(add_capture):
     """Each missing lib check must include a pip-install hint."""
     calls, fake_add = add_capture
 
-    with patch("ctypes.CDLL", side_effect=OSError("not found")):
+    with (
+        patch("ctypes.CDLL", side_effect=OSError("not found")),
+        patch("os.path.exists", return_value=False),  # nothing found anywhere
+    ):
         _check_trt_ep_load_chain(fake_add)
 
     for libsub in ["libnvinfer.so.10", "libcublas.so.12", "libcudnn.so.9"]:
@@ -141,6 +145,7 @@ def test_trt_ep_not_in_available_providers(add_capture):
 
     with (
         patch("ctypes.CDLL", return_value=MagicMock()),
+        patch("os.path.exists", return_value=True),
         patch.dict("sys.modules", {"onnxruntime": fake_ort, "onnx": _fake_onnx_module()}),
     ):
         _check_trt_ep_load_chain(fake_add)
@@ -167,6 +172,7 @@ def test_session_creates_but_trt_ep_falls_back(add_capture):
 
     with (
         patch("ctypes.CDLL", return_value=MagicMock()),
+        patch("os.path.exists", return_value=True),
         patch.dict("sys.modules", {"onnxruntime": fake_ort, "onnx": _fake_onnx_module()}),
     ):
         _check_trt_ep_load_chain(fake_add)
@@ -189,6 +195,7 @@ def test_session_creation_throws(add_capture):
 
     with (
         patch("ctypes.CDLL", return_value=MagicMock()),
+        patch("os.path.exists", return_value=True),
         patch.dict("sys.modules", {"onnxruntime": fake_ort, "onnx": _fake_onnx_module()}),
     ):
         _check_trt_ep_load_chain(fake_add)
