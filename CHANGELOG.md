@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.0 — 2026-04-29
+
+Hardware-aware decomposed export + C-level crash visibility. Two real-fix surfaces from the v0.5.x first-tester debug session.
+
+### Added
+- **`--export-mode {auto, parallel, sequential}` flag** on `reflex export` for pi0.5 decomposed exports. `auto` (default) probes free GPU VRAM and picks parallel iff `2 × estimated_model_vram + 1 GB buffer < free_vram`. `parallel` forces parallel and **fails loudly with `InsufficientVRAMError` before any model load** if the GPU can't fit (no silent fallback). `sequential` always works (the safe baseline). Per CLAUDE.md "no silent degradation."
+- **Multiprocessing wrapper for decomposed export** — when parallel mode is selected, `vlm_prefix` and `expert_denoise` exports run as two `multiprocessing.get_context("spawn")` worker processes that each load the policy independently from disk and produce their respective ONNX artifact in parallel. Subprocess crashes propagate to the parent with full traceback (no silent SubprocessError swallowing).
+- **`faulthandler.enable()` in FastAPI lifespan** — Python's built-in fault handler now installs at server startup so any C-level crash (SIGSEGV / SIGABRT / SIGFPE) during model load prints a Python traceback to stderr **before** the process dies. Without this, signal-based deaths were silent (caught 2026-04-28 by Rob's RTX 5090 segfault). Disable via `REFLEX_NO_FAULTHANDLER=1` env var.
+- **18 unit tests** for export-mode auto-detection across the hardware matrix (Mac CPU, Orin Nano 8 GB, A10G 24 GB, A100 80 GB, RTX 5090 32 GB, T4 16 GB borderline) — verify mode selection + InsufficientVRAMError behavior.
+- **Modal A100-80GB validation** of the full pipeline (`scripts/modal_export_pi05_decomposed.py --export-mode auto/parallel`). Auto run produced clean 12,995 MB decomposed export. Forced-parallel raised `InsufficientVRAMError` before model load. Full reproducer + cost (~$5) in `reflex_context/03_experiments/2026-04-28-pi05-decomposed-export-mode-modal.md`.
+
+### Notes
+- **Pi0.5 parallel actual-success not yet recorded** — would need a GPU with at least the conservative free-VRAM threshold (~112.7 GB free for pi0.5, only realistic on H200 / multi-GPU setups with workload that frees memory first). Documented honestly in the experiment note. SmolVLA decomposed export (which has much smaller per-pass VRAM) is the realistic parallel-win path; will land in a v0.6.x follow-up if/when SmolVLA decomposed export ships.
+- **No Blackwell support changes** in v0.6.0 — Blackwell remains documented as not yet supported (per v0.5.5 README). Real Blackwell fix is the v0.7 TensorRT-LLM runtime path (ADR `2026-04-28-tensorrt-llm-runtime-path.md` in the vault).
+- Repo gitignore extended to prevent agents/IDEs from accidentally creating a sibling `reflex_context/` inside reflex-vla (caught + cleaned up 2026-04-29).
+
 ## v0.5.5 — 2026-04-28
 
 Blackwell GPU support — TensorRT EP auto-disabled to prevent segfault.

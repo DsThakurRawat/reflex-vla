@@ -15,6 +15,7 @@ from rich.table import Table
 
 from reflex import __version__
 from reflex.config import ExportConfig, get_hardware_profile, HARDWARE_PROFILES
+from reflex.exporters._export_mode import ExportMode, InsufficientVRAMError
 
 app = typer.Typer(
     name="reflex",
@@ -46,6 +47,12 @@ def _setup_logging(verbose: bool = False) -> None:
         format="%(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+
+
+def _looks_like_pi05_model_ref(model: str) -> bool:
+    """Best-effort fast path for the HF/local refs handled by decomposed.py."""
+    normalized = model.lower().replace("-", "").replace("_", "")
+    return "pi05" in normalized or "pi0.5" in model.lower()
 
 
 def _version_callback(value: bool) -> None:
@@ -97,12 +104,19 @@ def export(
              "known correctness gaps. Monolithic requires `pip install "
              "'reflex-vla[monolithic]'` (pins transformers==5.3.0).",
     ),
+    export_mode: str = typer.Option(
+        "auto",
+        "--export-mode",
+        help="Decomposed pi0.5 export scheduling: auto, sequential, or parallel. "
+             "Only applies to --decomposed exports handled by the pi0.5 "
+             "vlm_prefix/expert_denoise exporter.",
+    ),
     num_steps: int = typer.Option(
         10,
         help="Denoise steps baked into the monolithic ONNX. "
              "Canonical flow-matching = 10 (SmolVLA, pi0, pi0.5); use 1 for exact "
              "one-shot Euler. GR00T (DDPM) uses 4 as its runtime default. "
-             "Only used when --monolithic is set.",
+             "For pi0.5 --decomposed, this is baked into expert_denoise.onnx.",
     ),
     from_distilled: bool = typer.Option(
         False,
@@ -118,8 +132,20 @@ def export(
     """Export a VLA model to ONNX + TensorRT for edge deployment."""
     _setup_logging(verbose)
     hardware = get_hardware_profile(target)
+    try:
+        requested_export_mode = ExportMode(export_mode)
+    except ValueError:
+        valid = ", ".join(mode.value for mode in ExportMode)
+        console.print(f"[red]Invalid --export-mode {export_mode!r}. Valid: {valid}[/red]")
+        raise typer.Exit(2)
 
     if monolithic:
+        if requested_export_mode != ExportMode.AUTO:
+            console.print(
+                "[red]--export-mode only applies to --decomposed pi0.5 exports; "
+                "monolithic export has no parallel prefix/expert split.[/red]"
+            )
+            raise typer.Exit(2)
         label = "SnapFlow student (1-NFE)" if from_distilled else "monolithic, cos=1.0 verified path"
         console.print(f"\n[bold]Reflex Export ({label})[/bold]")
         console.print(f"  Model:      {model}")
@@ -206,6 +232,68 @@ def export(
         else:
             console.print("\n[green]Dry run complete. Export should work.[/green]")
         raise typer.Exit()
+
+    if _looks_like_pi05_model_ref(model):
+        console.print("\n[bold]Reflex Export (pi0.5 decomposed)[/bold]")
+        console.print(f"  Model:       {model}")
+        console.print(f"  Target:      {hardware.name} ({hardware.memory_gb}GB, {hardware.trt_precision})")
+        console.print(f"  Output:      {output}")
+        console.print(f"  Export mode: {requested_export_mode.value}")
+        console.print()
+
+        try:
+            from reflex.exporters.decomposed import export_pi05_decomposed
+        except ImportError as exc:
+            console.print(f"[red]{exc}[/red]", markup=False)
+            console.print(
+                "\nFix: pip install 'reflex-vla[monolithic]' "
+                "(pins transformers==5.3.0; use a clean venv to avoid "
+                "the base transformers<5.0 conflict)",
+                style="cyan", markup=False,
+            )
+            raise typer.Exit(2)
+
+        import time
+        start = time.perf_counter()
+        decomposed_steps = 1 if from_distilled else num_steps
+        try:
+            result = export_pi05_decomposed(
+                model_id=model,
+                output_dir=output,
+                num_steps=decomposed_steps,
+                target=target,
+                student_checkpoint=model if from_distilled else None,
+                export_mode=requested_export_mode,
+            )
+        except InsufficientVRAMError as exc:
+            console.print(f"{exc}", style="red", markup=False)
+            raise typer.Exit(2)
+        except ImportError as exc:
+            console.print(f"Missing decomposed export dep: {exc}", style="red", markup=False)
+            raise typer.Exit(2)
+        except Exception as exc:  # noqa: BLE001
+            console.print(
+                f"Decomposed export failed: {type(exc).__name__}: {exc}",
+                style="red",
+                markup=False,
+            )
+            raise typer.Exit(1)
+
+        elapsed = time.perf_counter() - start
+        console.print(f"\n[bold green]Decomposed export complete in {elapsed:.1f}s[/bold green]")
+        console.print(f"  Mode:   {result.get('export_mode', requested_export_mode.value)}")
+        console.print(f"  Prefix: {result['vlm_prefix_onnx']} ({result['vlm_prefix_mb']:.1f} MB)")
+        console.print(f"  Expert: {result['expert_denoise_onnx']} ({result['expert_denoise_mb']:.1f} MB)")
+        console.print(f"\n  [dim]Next:[/dim] [cyan]reflex serve {output}[/cyan]")
+        raise typer.Exit(0)
+
+    if requested_export_mode != ExportMode.AUTO:
+        console.print(
+            "[red]--export-mode is only implemented for pi0.5 decomposed exports "
+            "handled by the vlm_prefix/expert_denoise exporter. Re-run with "
+            "--export-mode auto, or use a pi0.5 model ref.[/red]"
+        )
+        raise typer.Exit(2)
 
     # Full export — auto-dispatch to the right exporter based on model type
     from reflex.checkpoint import load_checkpoint, detect_model_type

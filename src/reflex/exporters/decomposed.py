@@ -54,11 +54,20 @@ is invoked here to get the shared denoise-step + cache-freeze patches.
 """
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 import json
 import logging
+import multiprocessing as mp
 import time
 from pathlib import Path
 from typing import Any
+
+from reflex.exporters._export_mode import (
+    ExportMode,
+    estimate_model_vram_from_onnx,
+    log_decision,
+    select_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +76,16 @@ logger = logging.getLogger(__name__)
 PI05_PALIGEMMA_LAYERS: int = 18  # pi05 paligemma has 18 transformer layers
 PI05_KV_HEADS: int = 1
 PI05_HEAD_DIM: int = 256
+_PI05_BATCH_SIZE: int = 1
+_PI05_IMAGE_SIZE: int = 224
+_PI05_LANG_TOKENS: int = 200
+_PI05_VISION_PATCHES_PER_VIEW: int = 256
+
+# Conservative pre-export estimate used by --export-mode auto. The decomposed
+# pi0.5 path has historically produced roughly 13 GiB of ONNX/external data.
+# Using that estimate keeps auto on the sequential baseline for most hardware,
+# while still allowing explicit or truly high-VRAM parallel runs.
+_PI05_ESTIMATED_ONNX_BYTES: int = int(13.0 * 1024 ** 3)
 
 
 def export_pi05_decomposed(
@@ -77,6 +96,7 @@ def export_pi05_decomposed(
     target: str = "desktop",
     student_checkpoint: str | Path | None = None,
     variant: str = "default",
+    export_mode: ExportMode | str = ExportMode.AUTO,
 ) -> dict[str, Any]:
     """Export pi0.5 as ``vlm_prefix.onnx`` + ``expert_denoise.onnx``.
 
@@ -93,29 +113,218 @@ def export_pi05_decomposed(
             checkpoint dir. When set, loads via ``load_snapflow_student``
             and enables the ``target_time_embed_mlp`` path. Must use
             ``num_steps=1`` in this mode.
+        export_mode: ``auto`` selects parallel only when the VRAM probe says
+            two independent policy loads fit. ``parallel`` fails loudly if
+            the probe says it will not fit. ``sequential`` preserves the
+            historical single-process export path.
 
     Returns dict with paths + byte sizes + sanity metadata.
     """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    requested_mode = ExportMode(export_mode)
+    estimated_vram = estimate_model_vram_from_onnx(_PI05_ESTIMATED_ONNX_BYTES)
+    decision = select_mode(requested_mode, estimated_vram)
+    log_decision(decision)
+
+    if decision.mode == ExportMode.PARALLEL:
+        return _export_pi05_decomposed_parallel(
+            model_id=model_id,
+            output_dir=output_dir,
+            num_steps=num_steps,
+            target=target,
+            student_checkpoint=student_checkpoint,
+            variant=variant,
+            export_mode_reason=decision.reason,
+        )
+
+    return _export_pi05_decomposed_sequential(
+        model_id=model_id,
+        output_dir=output_dir,
+        num_steps=num_steps,
+        target=target,
+        student_checkpoint=student_checkpoint,
+        variant=variant,
+        export_mode_reason=decision.reason,
+    )
+
+
+def _export_pi05_decomposed_sequential(
+    *,
+    model_id: str,
+    output_dir: Path,
+    num_steps: int,
+    target: str,
+    student_checkpoint: str | Path | None,
+    variant: str,
+    export_mode_reason: str,
+) -> dict[str, Any]:
+    """Historical pi0.5 decomposed export path: one policy load, two passes."""
+    policy = _load_pi05_policy(model_id, num_steps, student_checkpoint, variant)
+    past_kv_names = _past_kv_names()
+    prefix_seq_len = _prefix_seq_len()
+
+    prefix_meta = _export_pi05_prefix_pass(policy, output_dir, past_kv_names)
+
+    # Free the prefix wrapper before building the expert — on A100-80GB we
+    # OOM'd with both loaded + a second prefix forward for dummy inputs.
+    import gc
+    gc.collect()
+
+    expert_meta = _export_pi05_expert_pass(
+        policy=policy,
+        output_dir=output_dir,
+        num_steps=num_steps,
+        variant=variant,
+        past_kv_names=past_kv_names,
+        prefix_seq_len=prefix_seq_len,
+    )
+    _assert_matching_export_metadata(prefix_meta, expert_meta)
+
+    return _write_decomposed_export_result(
+        model_id=model_id,
+        output_dir=output_dir,
+        num_steps=num_steps,
+        target=target,
+        student_checkpoint=student_checkpoint,
+        variant=variant,
+        past_kv_names=past_kv_names,
+        chunk_size=int(prefix_meta["chunk_size"]),
+        action_dim=int(prefix_meta["action_dim"]),
+        export_mode=ExportMode.SEQUENTIAL,
+        export_mode_reason=export_mode_reason,
+    )
+
+
+def _export_pi05_decomposed_parallel(
+    *,
+    model_id: str,
+    output_dir: Path,
+    num_steps: int,
+    target: str,
+    student_checkpoint: str | Path | None,
+    variant: str,
+    export_mode_reason: str,
+) -> dict[str, Any]:
+    """Run prefix and expert export in separate spawned processes."""
+    past_kv_names = _past_kv_names()
+    prefix_seq_len = _prefix_seq_len()
+    prefix_meta, expert_meta = _run_parallel_pi05_exports(
+        model_id=model_id,
+        output_dir=output_dir,
+        num_steps=num_steps,
+        student_checkpoint=student_checkpoint,
+        variant=variant,
+        past_kv_names=past_kv_names,
+        prefix_seq_len=prefix_seq_len,
+    )
+    _assert_matching_export_metadata(prefix_meta, expert_meta)
+
+    return _write_decomposed_export_result(
+        model_id=model_id,
+        output_dir=output_dir,
+        num_steps=num_steps,
+        target=target,
+        student_checkpoint=student_checkpoint,
+        variant=variant,
+        past_kv_names=past_kv_names,
+        chunk_size=int(prefix_meta["chunk_size"]),
+        action_dim=int(prefix_meta["action_dim"]),
+        export_mode=ExportMode.PARALLEL,
+        export_mode_reason=export_mode_reason,
+    )
+
+
+def _run_parallel_pi05_exports(
+    *,
+    model_id: str,
+    output_dir: Path,
+    num_steps: int,
+    student_checkpoint: str | Path | None,
+    variant: str,
+    past_kv_names: list[str],
+    prefix_seq_len: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Submit the two independent export passes to spawned worker processes."""
+    ctx = mp.get_context("spawn")
+    student = str(student_checkpoint) if student_checkpoint is not None else None
+    with ProcessPoolExecutor(max_workers=2, mp_context=ctx) as pool:
+        prefix_future = pool.submit(
+            _export_pi05_prefix_worker,
+            model_id,
+            str(output_dir),
+            num_steps,
+            student,
+            variant,
+            past_kv_names,
+        )
+        expert_future = pool.submit(
+            _export_pi05_expert_worker,
+            model_id,
+            str(output_dir),
+            num_steps,
+            student,
+            variant,
+            past_kv_names,
+            prefix_seq_len,
+        )
+        return prefix_future.result(), expert_future.result()
+
+
+def _export_pi05_prefix_worker(
+    model_id: str,
+    output_dir: str,
+    num_steps: int,
+    student_checkpoint: str | None,
+    variant: str,
+    past_kv_names: list[str],
+) -> dict[str, Any]:
+    policy = _load_pi05_policy(model_id, num_steps, student_checkpoint, variant)
+    return _export_pi05_prefix_pass(policy, Path(output_dir), past_kv_names)
+
+
+def _export_pi05_expert_worker(
+    model_id: str,
+    output_dir: str,
+    num_steps: int,
+    student_checkpoint: str | None,
+    variant: str,
+    past_kv_names: list[str],
+    prefix_seq_len: int,
+) -> dict[str, Any]:
+    policy = _load_pi05_policy(model_id, num_steps, student_checkpoint, variant)
+    return _export_pi05_expert_pass(
+        policy=policy,
+        output_dir=Path(output_dir),
+        num_steps=num_steps,
+        variant=variant,
+        past_kv_names=past_kv_names,
+        prefix_seq_len=prefix_seq_len,
+    )
+
+
+def _load_pi05_policy(
+    model_id: str,
+    num_steps: int,
+    student_checkpoint: str | Path | None,
+    variant: str,
+):
+    """Load and patch the pi0.5 policy exactly once for one export process."""
     _require_decomposed_deps()
 
     import torch
-    import torch.nn as nn
-    from onnx_diagnostic.torch_export_patches import torch_export_patches
 
     from reflex.exporters.monolithic import (
         apply_export_patches,
         _force_eager_attn,
-        _fix_onnx_where_dtype_mismatches,
         _apply_pi05_denoise_step_patch,
     )
 
     apply_export_patches()
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load policy (student path handles target_time_embed_mlp weights;
-    # base path is a plain PI05Policy).
+    # Student path handles target_time_embed_mlp weights; base path is a plain
+    # PI05Policy. This function is process-local by design for parallel mode.
     t0 = time.time()
     if student_checkpoint is not None:
         if num_steps != 1:
@@ -155,34 +364,40 @@ def export_pi05_decomposed(
     _force_eager_attn(policy.model)
     _apply_pi05_denoise_step_patch()  # reuses monolithic's F.pad mask fix
     logger.info("[decomposed] Loaded in %.1fs", time.time() - t0)
+    return policy
+
+
+def _export_pi05_prefix_pass(
+    policy,
+    output_dir: Path,
+    past_kv_names: list[str],
+) -> dict[str, Any]:
+    import torch
+    from onnx_diagnostic.torch_export_patches import torch_export_patches
+
+    from reflex.exporters.monolithic import _fix_onnx_where_dtype_mismatches
 
     cfg = policy.config
-    B = 1
+    B = _PI05_BATCH_SIZE
     chunk = cfg.chunk_size
     action_dim = cfg.max_action_dim
 
-    # ---- Export 1: vlm_prefix.onnx -----------------------------------
     prefix_wrapper = Pi05PrefixWrapper(policy.model).eval()
 
     prefix_dummy = dict(
-        img_base=torch.randn(B, 3, 224, 224, dtype=torch.float32),
-        img_wrist_l=torch.randn(B, 3, 224, 224, dtype=torch.float32),
-        img_wrist_r=torch.randn(B, 3, 224, 224, dtype=torch.float32),
+        img_base=torch.randn(B, 3, _PI05_IMAGE_SIZE, _PI05_IMAGE_SIZE, dtype=torch.float32),
+        img_wrist_l=torch.randn(B, 3, _PI05_IMAGE_SIZE, _PI05_IMAGE_SIZE, dtype=torch.float32),
+        img_wrist_r=torch.randn(B, 3, _PI05_IMAGE_SIZE, _PI05_IMAGE_SIZE, dtype=torch.float32),
         mask_base=torch.ones(B, dtype=torch.bool),
         mask_wrist_l=torch.ones(B, dtype=torch.bool),
         mask_wrist_r=torch.ones(B, dtype=torch.bool),
         # Preprocessor pads pi0.5 lang prompts to 200 tokens at runtime;
         # match so the exported ONNX doesn't ARG-fail when LIBERO feeds
         # 200-token prompts. 3*256 vision + 200 lang = 968 prefix_seq_len.
-        lang_tokens=torch.randint(0, 257152, (B, 200), dtype=torch.long),
-        lang_masks=torch.ones(B, 200, dtype=torch.bool),
+        lang_tokens=torch.randint(0, 257152, (B, _PI05_LANG_TOKENS), dtype=torch.long),
+        lang_masks=torch.ones(B, _PI05_LANG_TOKENS, dtype=torch.bool),
     )
 
-    # 36 past_k_i / past_v_i outputs + 1 prefix_pad_masks.
-    past_kv_names = []
-    for layer_idx in range(PI05_PALIGEMMA_LAYERS):
-        past_kv_names.append(f"past_k_{layer_idx}")
-        past_kv_names.append(f"past_v_{layer_idx}")
     prefix_output_names = past_kv_names + ["prefix_pad_masks"]
 
     prefix_path = output_dir / "vlm_prefix.onnx"
@@ -207,23 +422,42 @@ def export_pi05_decomposed(
     prefix_fixes = _fix_onnx_where_dtype_mismatches(prefix_path)
     logger.info("[decomposed] prefix Cast fixes: %d", prefix_fixes)
 
-    # ---- Export 2: expert_denoise.onnx --------------------------------
-    # Free the prefix wrapper before building the expert — on A100-80GB
-    # we OOM'd with both loaded + a second prefix forward for dummy
-    # inputs. Generate expert dummies from known static shapes instead.
-    import gc
     del prefix_wrapper, ep_prefix
-    gc.collect()
+    return {
+        "chunk_size": int(chunk),
+        "action_dim": int(action_dim),
+        "prefix_seq_len": _prefix_seq_len(),
+        "prefix_cast_fixes": int(prefix_fixes),
+    }
+
+
+def _export_pi05_expert_pass(
+    *,
+    policy,
+    output_dir: Path,
+    num_steps: int,
+    variant: str,
+    past_kv_names: list[str],
+    prefix_seq_len: int,
+) -> dict[str, Any]:
+    import torch
+    from onnx_diagnostic.torch_export_patches import torch_export_patches
+
+    from reflex.exporters.monolithic import _fix_onnx_where_dtype_mismatches
+
+    cfg = policy.config
+    B = _PI05_BATCH_SIZE
+    chunk = cfg.chunk_size
+    action_dim = cfg.max_action_dim
 
     # pi05 prefix_seq_len must match exactly what vlm_prefix.onnx will
-    # emit at runtime. With lang_tokens=(B,16) dummies above and 3 vision
+    # emit at runtime. With lang_tokens=(B,200) dummies above and 3 vision
     # views × 256 patches each, the natural prefix seq_len is
-    # 3×256 + 16 = 784. Both ONNX graphs are shape-specialized to their
+    # 3×256 + 200 = 968. Both ONNX graphs are shape-specialized to their
     # export-time seq_len so they MUST match or attention will compute
     # on zero-padded tail positions. (For production with longer lang
     # prompts, both graphs would need dynamic seq_len via
     # torch.export Dim — deferred until parity is green.)
-    prefix_seq_len = 3 * 256 + int(prefix_dummy["lang_tokens"].shape[1])
     past_kv_shape = (B, PI05_KV_HEADS, prefix_seq_len, PI05_HEAD_DIM)
     past_kv_dummies = [
         torch.randn(past_kv_shape, dtype=torch.float32)
@@ -266,17 +500,44 @@ def export_pi05_decomposed(
     expert_fixes = _fix_onnx_where_dtype_mismatches(expert_path)
     logger.info("[decomposed] expert Cast fixes: %d", expert_fixes)
 
-    # ---- Write reflex_config.json + VERIFICATION stub -----------------
+    del expert_wrapper, ep_expert
+    return {
+        "chunk_size": int(chunk),
+        "action_dim": int(action_dim),
+        "prefix_seq_len": int(prefix_seq_len),
+        "expert_cast_fixes": int(expert_fixes),
+    }
+
+
+def _write_decomposed_export_result(
+    *,
+    model_id: str,
+    output_dir: Path,
+    num_steps: int,
+    target: str,
+    student_checkpoint: str | Path | None,
+    variant: str,
+    past_kv_names: list[str],
+    chunk_size: int,
+    action_dim: int,
+    export_mode: ExportMode,
+    export_mode_reason: str,
+) -> dict[str, Any]:
+    prefix_path = output_dir / "vlm_prefix.onnx"
+    expert_path = output_dir / "expert_denoise.onnx"
+
     reflex_cfg = {
         "model_id": model_id if student_checkpoint is None else str(student_checkpoint),
         "model_type": "pi05_decomposed_student" if student_checkpoint else "pi05_decomposed",
         "target": target,
         "num_denoising_steps": num_steps,
-        "chunk_size": chunk,
-        "action_chunk_size": chunk,
+        "chunk_size": chunk_size,
+        "action_chunk_size": chunk_size,
         "action_dim": action_dim,
         "opset": 19,
         "export_kind": "decomposed",
+        "export_mode": export_mode.value,
+        "export_mode_reason": export_mode_reason,
         "decomposed": {
             "vlm_prefix_onnx": "vlm_prefix.onnx",
             "expert_denoise_onnx": "expert_denoise.onnx",
@@ -310,7 +571,32 @@ def export_pi05_decomposed(
         "total_mb": size_prefix + size_expert + external_mb,
         "num_steps": num_steps,
         "paligemma_layers": PI05_PALIGEMMA_LAYERS,
+        "export_mode": export_mode.value,
     }
+
+
+def _past_kv_names() -> list[str]:
+    names = []
+    for layer_idx in range(PI05_PALIGEMMA_LAYERS):
+        names.append(f"past_k_{layer_idx}")
+        names.append(f"past_v_{layer_idx}")
+    return names
+
+
+def _prefix_seq_len() -> int:
+    return 3 * _PI05_VISION_PATCHES_PER_VIEW + _PI05_LANG_TOKENS
+
+
+def _assert_matching_export_metadata(
+    prefix_meta: dict[str, Any],
+    expert_meta: dict[str, Any],
+) -> None:
+    for key in ("chunk_size", "action_dim", "prefix_seq_len"):
+        if int(prefix_meta[key]) != int(expert_meta[key]):
+            raise RuntimeError(
+                f"decomposed export metadata mismatch for {key}: "
+                f"prefix={prefix_meta[key]!r}, expert={expert_meta[key]!r}"
+            )
 
 
 class Pi05PrefixWrapper:

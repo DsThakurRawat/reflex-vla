@@ -1559,6 +1559,31 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app):
+        # Enable Python's fault handler so any C-level crash (SIGSEGV /
+        # SIGABRT / SIGFPE) during model load prints a Python traceback
+        # to stderr BEFORE the process dies. Without this, signal-based
+        # death is silent — the process just exits with code 139 and
+        # the user has no idea what crashed. Caught 2026-04-28 by
+        # first-tester Rob (RTX 5090 segfault in ORT-CUDA EP, Blackwell
+        # sm_100 not supported by bundled cuBLAS/cuDNN).
+        #
+        # User can disable via REFLEX_NO_FAULTHANDLER=1 if they have a
+        # different faulthandler installed (e.g., sentry-sdk's). Default
+        # ON because the cost is negligible (one signal handler) and
+        # the value is enormous when something goes wrong.
+        import os as _os_fh
+        if not _os_fh.environ.get("REFLEX_NO_FAULTHANDLER"):
+            try:
+                import faulthandler as _fh
+                _fh.enable()
+                logger.info(
+                    "faulthandler enabled — C-level crashes (SIGSEGV/SIGABRT) "
+                    "will print a Python traceback to stderr before the "
+                    "process dies. Disable via REFLEX_NO_FAULTHANDLER=1."
+                )
+            except Exception as _fh_exc:  # noqa: BLE001
+                logger.warning("faulthandler.enable() failed: %s", _fh_exc)
+
         # Initialize OTel tracing if [tracing] extra is installed AND
         # OTEL_EXPORTER_OTLP_ENDPOINT is set (or default localhost:4317).
         # No-ops cleanly if deps absent — server behavior unchanged.

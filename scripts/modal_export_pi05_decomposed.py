@@ -19,6 +19,7 @@ import subprocess
 import modal
 
 app = modal.App("reflex-export-pi05-decomposed")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _hf_secret():
@@ -33,10 +34,9 @@ def _hf_secret():
 
 def _repo_head_sha() -> str:
     try:
-        cwd = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
-            cwd=cwd, stderr=subprocess.DEVNULL,
+            cwd=REPO_ROOT, stderr=subprocess.DEVNULL,
         ).decode().strip()[:12]
     except Exception:
         return "main"
@@ -73,10 +73,30 @@ image = (
         "accelerate",
         "draccus",
     )
+    .add_local_dir(
+        os.path.join(REPO_ROOT, "src"),
+        remote_path="/root/reflex-vla/src",
+        copy=True,
+        ignore=["**/__pycache__/**", "**/*.pyc"],
+    )
+    .add_local_file(
+        os.path.join(REPO_ROOT, "pyproject.toml"),
+        remote_path="/root/reflex-vla/pyproject.toml",
+        copy=True,
+    )
+    .add_local_file(
+        os.path.join(REPO_ROOT, "README.md"),
+        remote_path="/root/reflex-vla/README.md",
+        copy=True,
+    )
+    .add_local_file(
+        os.path.join(REPO_ROOT, "LICENSE"),
+        remote_path="/root/reflex-vla/LICENSE",
+        copy=True,
+    )
     .run_commands(
         f'echo "build_bust={_BUST}"',
-        f'pip install "reflex-vla[monolithic] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla@{_HEAD}"',
-        secrets=[modal.Secret.from_name("github-token")],
+        'pip install -e "/root/reflex-vla[monolithic]"',
     )
     .env({
         "HF_HOME": HF_CACHE,
@@ -98,6 +118,7 @@ def export_decomposed_modal(
     num_steps: int = 1,
     student_checkpoint: str = "",
     variant: str = "default",
+    export_mode: str = "auto",
 ):
     """Run the decomposed export on Modal. variant='state_out' for v0.5 students."""
     import logging
@@ -113,13 +134,24 @@ def export_decomposed_modal(
     if student and not student.exists():
         raise FileNotFoundError(f"student checkpoint missing: {student}")
 
-    result = export_pi05_decomposed(
-        model_id=model_id,
-        output_dir=str(out),
-        num_steps=num_steps,
-        student_checkpoint=str(student) if student else None,
-        variant=variant,
-    )
+    try:
+        result = export_pi05_decomposed(
+            model_id=model_id,
+            output_dir=str(out),
+            num_steps=num_steps,
+            student_checkpoint=str(student) if student else None,
+            variant=variant,
+            export_mode=export_mode,
+        )
+    except Exception as exc:
+        if exc.__class__.__name__ == "InsufficientVRAMError":
+            return {
+                "status": "error",
+                "error_type": exc.__class__.__name__,
+                "message": str(exc),
+            }
+        raise
+
     onnx_output.commit()
 
     import onnx
@@ -137,6 +169,7 @@ def main(
     num_steps: int = 1,
     student_checkpoint: str = "",
     variant: str = "default",
+    export_mode: str = "auto",
 ):
     r = export_decomposed_modal.remote(
         model_id=model_id,
@@ -144,6 +177,7 @@ def main(
         num_steps=num_steps,
         student_checkpoint=student_checkpoint,
         variant=variant,
+        export_mode=export_mode,
     )
     print("\n=== RESULT ===")
     for k, v in r.items():

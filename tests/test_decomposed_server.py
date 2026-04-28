@@ -16,14 +16,12 @@ import base64
 import io
 import json
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pytest
 
 from reflex.runtime.decomposed_server import (
     DEFAULT_CAMERA_RESOLUTION,
-    DEFAULT_CHUNK_SIZE,
     DEFAULT_LANG_SEQ_LEN,
     DEFAULT_MAX_ACTION_DIM,
     Pi05DecomposedServer,
@@ -33,6 +31,12 @@ from reflex.runtime.decomposed_server import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _disable_hf_normalizer_fallback(monkeypatch):
+    """Unit tests should not fetch teacher normalizers from HuggingFace."""
+    monkeypatch.setattr(Pi05DecomposedServer, "_infer_teacher_ref", lambda self: None)
 
 
 def _make_export_dir(
@@ -46,7 +50,10 @@ def _make_export_dir(
     p = tmp_path / "export"
     p.mkdir()
     config = {
-        "model_id": "lerobot/pi05_libero_finetuned_v044",
+        # Keep this fixture local-only. A real HF repo id triggers teacher
+        # normalizer fallback during server.load(), which makes these unit
+        # tests depend on network/cache state.
+        "model_id": "test-pi05-decomposed",
         "model_type": "pi05_decomposed_student",
         "target": "desktop",
         "num_denoising_steps": 1,
