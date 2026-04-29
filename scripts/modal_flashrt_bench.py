@@ -1,0 +1,262 @@
+"""Modal: build + bench FlashRT public Python version on A100.
+
+Validates LiangSu8899/FlashRT's 18× JAX baseline claim on shared hardware
+(A100, vs their Thor + 5090 + 4090 published numbers). Establishes
+reflex-vla's baseline before Liang's pure-C++ pi05 binary arrives ~2026-05-06
+for the `--runtime flashrt` integration spike.
+
+Per 2026-04-29 Discord exchange + competitor profile
+`reflex_context/02_research/competitors/flashrt.md`.
+
+Usage:
+    modal profile activate suranjana-jain
+    HF_TOKEN=<token> modal run scripts/modal_flashrt_bench.py
+
+Cost: ~$5-8 ($3 image build first time / cached afterward, $2-3 GPU run).
+Wall: ~25-40 min first run (cmake + make on CUTLASS + checkpoint download
++ FP8 calibration + benchmark), ~5-10 min subsequent runs (cached).
+"""
+from __future__ import annotations
+
+import os
+import modal
+
+app = modal.App("flashrt-bench")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _build_bust() -> str:
+    import time
+    return str(int(time.time()))
+
+
+_BUILD_BUST = _build_bust()
+
+
+def _hf_secret():
+    token = os.environ.get("HF_TOKEN", "")
+    if token:
+        return modal.Secret.from_dict({"HF_TOKEN": token})
+    try:
+        return modal.Secret.from_name("huggingface")
+    except Exception:
+        return modal.Secret.from_dict({})
+
+
+# Persistent volume to cache the cloned FlashRT + built kernels + HF cache
+# across runs. First run takes the build hit; subsequent runs reuse.
+hf_cache = modal.Volume.from_name("pi0-hf-cache", create_if_missing=True)
+flashrt_cache = modal.Volume.from_name("flashrt-cache", create_if_missing=True)
+HF_CACHE = "/root/.cache/huggingface"
+FLASHRT_DIR = "/opt/flashrt"
+
+
+# Per FlashRT INSTALL.md prerequisites:
+# - CUDA 12.4+ devel image (cmake needs nvcc, not just CUDA runtime)
+# - GCC 11+ (C++17), CMake 3.24+
+# - SM80+ GPU (A100 = SM80, fits)
+# - Python 3.10/3.11/3.12 with the SAME interpreter for cmake AND import
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .apt_install(
+        "git",
+        "build-essential",
+        "cmake",
+        "wget",
+        "ninja-build",
+    )
+    .run_commands(
+        # Verify cmake version (need 3.24+) and gcc (need 11+).
+        "cmake --version && gcc --version",
+    )
+    .pip_install(
+        # FlashRT's torch frontend requires torch + safetensors + numpy.
+        # Pinning torch to match CUDA 12 + SM80.
+        "torch==2.5.1",
+        "safetensors>=0.4.0",
+        "numpy<2.0",
+        "pybind11>=2.12",
+        "huggingface_hub>=0.20",
+        "transformers>=4.40,<5.4",
+        "Pillow",
+    )
+    .env({
+        "HF_HOME": HF_CACHE,
+        "TRANSFORMERS_CACHE": f"{HF_CACHE}/transformers",
+        # CMake needs to find the right CUDA + compiler.
+        "CUDACXX": "/usr/local/cuda/bin/nvcc",
+        "PATH": "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    })
+    .run_commands(
+        # Bust cache for the actual build step so we re-pull FlashRT HEAD
+        # if needed but keep the image base layers cached.
+        f'echo "build_bust={_BUILD_BUST}"',
+        # Clone FlashRT + CUTLASS 4.4.2 (pinned per their INSTALL.md §4),
+        # then cmake + make + editable pip install. This is the one-time
+        # ~10-15 min compile step.
+        f"mkdir -p {FLASHRT_DIR} && cd {FLASHRT_DIR} && "
+        "git clone --depth 1 https://github.com/LiangSu8899/FlashRT.git . && "
+        "git clone --depth 1 --branch v4.4.2 "
+        "  https://github.com/NVIDIA/cutlass.git third_party/cutlass && "
+        "mkdir -p build && cd build && "
+        # SM80 = A100, SM86 = A10/A10G, SM89 = 4090, SM120 = 5090.
+        # Building only SM80 to keep compile time manageable on first run.
+        "cmake .. -GNinja "
+        "  -DCMAKE_BUILD_TYPE=Release "
+        "  -DCMAKE_CUDA_ARCHITECTURES=80 "
+        "  -DENABLE_FA2=ON && "
+        "ninja -j$(nproc) && "
+        f"cd {FLASHRT_DIR} && pip install -e '.[torch]'",
+        gpu="A100-80GB",  # cmake reads $CUDA_ARCH_LIST + needs nvcc; build on GPU
+    )
+)
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    volumes={HF_CACHE: hf_cache, FLASHRT_DIR + "_cache": flashrt_cache},
+    secrets=[_hf_secret()],
+    timeout=2400,  # 40 min hard cap
+)
+def bench(
+    checkpoint_id: str = "lerobot/pi05_libero_finetuned_v044",
+    benchmark_iters: int = 20,
+    warmup_iters: int = 50,
+    num_views: int = 2,
+    prompt: str = "pick up the red block and place it in the tray",
+):
+    """Run FlashRT's bundled quickstart benchmark + compare to reflex-vla
+    cuda-graphs A/B numbers.
+
+    Returns dict with measured latency stats + verification info.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    print("=" * 60)
+    print("FlashRT bench on A100-80GB")
+    print(f"checkpoint: {checkpoint_id}")
+    print(f"benchmark_iters: {benchmark_iters}, warmup: {warmup_iters}")
+    print(f"num_views: {num_views}")
+    print("=" * 60)
+
+    # ---- 1. Verify FlashRT is built + importable ----
+    print("\n[1/4] verifying flash_vla import...", flush=True)
+    try:
+        import flash_vla
+        print(f"  flash_vla.__version__ = {getattr(flash_vla, '__version__', '(no __version__)')}")
+        from flash_vla import flash_vla_kernels  # noqa: F401
+        print(f"  flash_vla.flash_vla_kernels imported OK")
+    except Exception as exc:
+        return {"status": "fail", "stage": "import", "error": repr(exc)}
+
+    # ---- 2. Download checkpoint via HF cache ----
+    print(f"\n[2/4] downloading {checkpoint_id}...", flush=True)
+    from huggingface_hub import snapshot_download
+    try:
+        ckpt_path = snapshot_download(
+            repo_id=checkpoint_id,
+            cache_dir=HF_CACHE,
+        )
+        print(f"  checkpoint at: {ckpt_path}")
+        # FlashRT expects a directory containing the safetensors weights;
+        # explore the structure to find the right subdirectory.
+        for entry in Path(ckpt_path).iterdir():
+            print(f"  - {entry.name}")
+    except Exception as exc:
+        return {"status": "fail", "stage": "checkpoint_download", "error": repr(exc)}
+
+    # ---- 3. Run quickstart benchmark ----
+    print(f"\n[3/4] running examples/quickstart.py --benchmark {benchmark_iters}...", flush=True)
+    cmd = [
+        sys.executable,
+        f"{FLASHRT_DIR}/examples/quickstart.py",
+        "--checkpoint", str(ckpt_path),
+        "--framework", "torch",
+        "--num_views", str(num_views),
+        "--prompt", prompt,
+        "--benchmark", str(benchmark_iters),
+        "--warmup", str(warmup_iters),
+        "--autotune", "3",
+    ]
+    print(f"  cmd: {' '.join(cmd)}")
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env={**os.environ},
+        timeout=1800,
+    )
+    wall_s = time.perf_counter() - t0
+    print(f"\n--- quickstart stdout ---")
+    print(proc.stdout[-4000:] if len(proc.stdout) > 4000 else proc.stdout)
+    if proc.returncode != 0:
+        print(f"\n--- quickstart stderr ---")
+        print(proc.stderr[-2000:])
+        return {
+            "status": "fail",
+            "stage": "benchmark",
+            "exit_code": proc.returncode,
+            "stderr_tail": proc.stderr[-2000:],
+            "wall_s": wall_s,
+        }
+    print(f"\n  wall: {wall_s:.1f}s, exit 0")
+
+    # ---- 4. Summarize ----
+    print(f"\n[4/4] summary")
+    print(f"  reflex-vla cuda-graphs A/B (A100, pi0.5 num_steps=10):")
+    print(f"    OFF: 270.85 ms / chunk")
+    print(f"    ON:  207.74 ms / chunk (1.30x speedup)")
+    print(f"  See reflex_context/03_experiments/2026-04-29-cuda-graphs-ab-modal-a100.md")
+    print(f"")
+    print(f"  FlashRT published numbers:")
+    print(f"    Pi0.5 RTX 5090: 17.58 ms (57 Hz)")
+    print(f"    Pi0.5 Thor:     44 ms / 39.78 ms NVFP4")
+    print(f"    A100: not published, this run is the first reference")
+
+    return {
+        "status": "ok",
+        "checkpoint": checkpoint_id,
+        "wall_s": wall_s,
+        "stdout_tail": proc.stdout[-4000:] if len(proc.stdout) > 4000 else proc.stdout,
+    }
+
+
+@app.local_entrypoint()
+def main(
+    checkpoint_id: str = "lerobot/pi05_libero_finetuned_v044",
+    benchmark_iters: int = 20,
+    warmup_iters: int = 50,
+):
+    """Local entrypoint."""
+    print("FlashRT bench → A100-80GB → quickstart --benchmark")
+    print(f"  checkpoint: {checkpoint_id}")
+    print(f"  iters: {benchmark_iters} (warmup: {warmup_iters})")
+    print()
+    result = bench.remote(
+        checkpoint_id=checkpoint_id,
+        benchmark_iters=benchmark_iters,
+        warmup_iters=warmup_iters,
+    )
+    print()
+    print("=" * 60)
+    print("RESULT")
+    print("=" * 60)
+    print(f"  status: {result.get('status')}")
+    if result.get("status") == "ok":
+        print(f"  wall:   {result.get('wall_s', '?'):.1f}s")
+        print()
+        print("Stdout tail (last ~4000 chars):")
+        print(result.get("stdout_tail", "(none)"))
+    else:
+        print(f"  stage:  {result.get('stage')}")
+        print(f"  error:  {result.get('error', result.get('stderr_tail', '(none)'))}")
