@@ -147,6 +147,10 @@ def collect_and_train(
     seed: int = 11,
     serve_health_timeout_s: int = 480,
     serve_port: int = 8000,
+    # Phase 2 fixes per 2026-04-29-a2c2-correction_research_revisit:
+    collect_inject_latency_ms: float = 0.0,  # pass --inject-latency-ms to reflex serve at collect time
+    l2_penalty_override: float = -1.0,  # if > 0, override L2_MAGNITUDE_PENALTY constant
+    use_actual_latency: bool = False,  # use record's measured latency_ms instead of synthesized i*median_step_ms
 ) -> dict:
     """Run collection + training in one Modal call. Returns paths + summary."""
     import base64
@@ -185,6 +189,12 @@ def collect_and_train(
         "--no-strict-providers",
         "--no-prewarm",
     ]
+    if collect_inject_latency_ms > 0:
+        # Phase 2: collect at runtime-like latency so training distribution
+        # matches eval distribution. Lens 3 of the 2026-04-29 research-revisit
+        # showed training-vs-eval distribution mismatch was 40-50% of failure.
+        serve_cmd += ["--inject-latency-ms", str(collect_inject_latency_ms)]
+        print(f"[real_traces] Phase 2 collection: --inject-latency-ms {collect_inject_latency_ms}")
     print(f"[real_traces] starting: {' '.join(serve_cmd)}")
     serve_proc = subprocess.Popen(serve_cmd, env={**os.environ})
 
@@ -389,7 +399,13 @@ def collect_and_train(
                 base_rows.append(stale)
                 obs_rows.append(obs_pad)
                 chunk_pos_rows.append(i)
-                latency_rows.append(i * median_step_ms)
+                if use_actual_latency:
+                    # Phase 2: use the actual measured latency at the record
+                    # where the action would be executed. With --inject-latency-ms
+                    # at collection, this matches runtime distribution.
+                    latency_rows.append(float(recs[t + i].get("latency_ms", median_step_ms * (i + 1))))
+                else:
+                    latency_rows.append(i * median_step_ms)
                 target_rows.append(target)
     n_pairs = len(base_rows)
     print(f"[real_traces] synthesized {n_pairs} (stale, fresh) training pairs")
@@ -409,6 +425,17 @@ def collect_and_train(
 
     # ---- 4. Train numpy A2C2 head ----
     from reflex.correction import A2C2Config, train_a2c2_head, evaluate_mse
+    from reflex.correction import a2c2_training as _a2c2_training_module
+
+    # Phase 2: relax L2 magnitude penalty if requested. Phase 1 default
+    # 0.01 was conservative — head learned magnitude ~0.1/step (chunk 0.755).
+    # Phase 2 with multi-latency training data may need 0.001 to allow
+    # actually-useful magnitude ~0.5-1.0/step.
+    if l2_penalty_override > 0:
+        _orig_l2 = _a2c2_training_module.L2_MAGNITUDE_PENALTY
+        _a2c2_training_module.L2_MAGNITUDE_PENALTY = l2_penalty_override
+        print(f"[real_traces] Phase 2: L2_MAGNITUDE_PENALTY override "
+              f"{_orig_l2} -> {l2_penalty_override}")
 
     cfg = A2C2Config(
         action_dim=target_action_dim,
@@ -485,21 +512,40 @@ def main(
     epochs: int = 20,
     batch_size: int = 64,
     lr: float = 1e-3,
+    # Phase 2 flags per 2026-04-29-a2c2-correction_research_revisit:
+    collect_inject_latency_ms: float = 0.0,
+    l2_penalty_override: float = -1.0,
+    use_actual_latency: bool = False,
 ):
     """Collect real LIBERO traces + train A2C2 head on (stale, fresh) gap.
 
     Output: /gate_out/<label>/a2c2_head_real.npz (loadable by reflex serve --a2c2-checkpoint)
+
+    Phase 2 invocation:
+        modal run scripts/modal_a2c2_real_traces.py \\
+            --label phase2-multilat-2ep \\
+            --num-collect 2 \\
+            --epochs 5 \\
+            --collect-inject-latency-ms 100 \\
+            --l2-penalty-override 0.001 \\
+            --use-actual-latency
     """
     print("=" * 70)
     print("A2C2 real-trace collect + train")
     print("=" * 70)
     print(f"label: {label}, num_collect: {num_collect}, epochs: {epochs}")
+    if collect_inject_latency_ms > 0:
+        print(f"Phase 2: collect_inject_latency_ms={collect_inject_latency_ms}, "
+              f"l2_penalty={l2_penalty_override}, use_actual_latency={use_actual_latency}")
     r = collect_and_train.remote(
         output_label=label,
         num_collect_episodes=num_collect,
         train_epochs=epochs,
         train_batch_size=batch_size,
         train_lr=lr,
+        collect_inject_latency_ms=collect_inject_latency_ms,
+        l2_penalty_override=l2_penalty_override,
+        use_actual_latency=use_actual_latency,
     )
     print("\n=== RESULT ===")
     if r.get("status") == "fail":

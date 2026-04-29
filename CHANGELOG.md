@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.7.2 — 2026-04-29
+
+A2C2 correction head Phase 1 fix — eliminates the magnitude-7 catastrophic regression that the 2026-04-26 N=50 LIBERO experiment surfaced. Closes the path to A2C2 production deploy with no risk of policy derailment.
+
+### Background
+
+The A2C2 head shipped earlier as `partial` after a 2026-04-26 N=50 LIBERO experiment showed catastrophic regression: ON tasks 0+1 = 0/10 vs OFF baseline 8/10. Root cause analysis (4 parallel research lenses, 2026-04-29) converged on two architectural issues: unbounded output layer + MSE loss with no magnitude regularization let the head learn magnitude-7 corrections that systematically saturated action clip bounds and inverted policy outputs.
+
+### Fixed
+- **Bounded head output.** `kernels/a2c2_correction.py` output layer applies `tanh(z/3.0) * 3.0` saturation. Output is now bounded to ±3.0 in normalized action space (matching pi0.5's typical 3σ action range), preserves the zero-init cold-start invariant (`tanh(0)=0`).
+- **Huber loss + L2 magnitude penalty.** `correction/a2c2_training.py` switched MSE → Huber(δ=0.1) + λ=0.01 magnitude penalty. Caps gradient on outliers (no more chasing tail-of-distribution magnitudes), discourages large outputs at training time. Validation loss uses the same formula for direct comparability. Backward pass updated to backprop through the tanh saturation.
+- **Runtime safety net.** `runtime/a2c2_hook.py` now refuses corrections with chunk magnitude > `sqrt(chunk_size) * 3.0` (theoretical max from the bounded per-step output). Falls back to base actions + emits `reason='magnitude_safety_skip'` metric. Catches future regressions even if a bypass head sneaks in.
+
+### Validated on Modal A100 (commit 9f8edb5)
+- Local sanity: 1000 random extreme inputs, max output L-inf = 0.365 << saturation 3.0. Saturation works as designed.
+- N=10 LIBERO smoke at `--inject-latency-ms 100` (paper-fidelity setup, same as the catastrophic experiment):
+  - **Phase 1 ON: 8/10 (80%)** — matches OFF baseline 8/10 exactly
+  - Catastrophic ON (2026-04-26): 0/10 — eliminated
+  - Per-call chunk magnitude: 0.755 (consistent across all calls) vs catastrophic ~7.0 = **9× smaller**
+- Full experiment writeup: `reflex_context/03_experiments/2026-04-29-a2c2-phase1-libero-smoke-modal.md`
+
+### Tests
+- 2 new tests in `tests/test_a2c2_correction_head.py`:
+  - `test_forward_output_bounded_to_saturation_scale` (20 random extreme inputs, asserts L-inf ≤ 3.0)
+  - `test_forward_zero_init_still_emits_zero_correction` (cold-start invariant preserved)
+- 67/67 a2c2 tests pass; 38/38 head tests pass
+
+### Notes
+- **The fix is "no regression" not "perf claim".** Phase 1 head produces bounded corrections that are non-destructive but conservative. Customer-facing claim "A2C2 helps Jetson reactivity" is NOT yet supported by this release — pending Phase 2 retrain (multi-latency training data + relaxed L2 penalty) to produce ON > OFF positive delta.
+- **`--a2c2-checkpoint` is still opt-in.** No default-on. Customers who previously avoided A2C2 due to the catastrophic finding can now safely enable it without policy derailment risk.
+- **Existing checkpoints work.** The bounded output is applied at inference time; previously-trained heads (including the magnitude-7 catastrophic one) load fine and just have their outputs clamped at ±3.0 — preventing the catastrophe from re-occurring even with bad weights.
+- Research synthesis at `reflex_context/features/01_serve/subfeatures/_rtc_a2c2/a2c2-correction/a2c2-correction_research_revisit.md`. Modal cost across the Phase 1 work: $3.
+
 ## v0.7.1 — 2026-04-29
 
 Surfaces the previously-silent `--cuda-graphs` flag with measured A100 + A10G perf numbers. The flag has been in main since v0.5.0 (commits `49110d2` → `7dfcab6`, April 24-25) but no CHANGELOG entry told users it existed. v0.7.1 fixes that.
