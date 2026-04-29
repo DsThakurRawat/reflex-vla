@@ -64,15 +64,17 @@ image = (
     .apt_install(
         "git",
         "build-essential",
-        "cmake",
         "wget",
         "ninja-build",
-    )
-    .run_commands(
-        # Verify cmake version (need 3.24+) and gcc (need 11+).
-        "cmake --version && gcc --version",
+        # NOTE: cmake from apt is 3.22.1 on Ubuntu 22.04 jammy, but FlashRT's
+        # CMakeLists.txt requires 3.24+. We install cmake via pip below so
+        # /usr/local/bin/cmake (3.x latest) wins on PATH.
     )
     .pip_install(
+        # cmake>=3.24 required by FlashRT's CMakeLists.txt.
+        # The pip-installed cmake binary lives in /usr/local/bin, which is
+        # before /usr/bin in our PATH env, so it shadows the apt cmake (if any).
+        "cmake>=3.24,<4",
         # FlashRT's torch frontend requires torch + safetensors + numpy.
         # Pinning torch to match CUDA 12 + SM80.
         "torch==2.5.1",
@@ -82,6 +84,10 @@ image = (
         "huggingface_hub>=0.20",
         "transformers>=4.40,<5.4",
         "Pillow",
+    )
+    .run_commands(
+        # Verify versions: cmake (need 3.24+ from pip), gcc (need 11+ from apt).
+        "which cmake && cmake --version && gcc --version",
     )
     .env({
         "HF_HOME": HF_CACHE,
