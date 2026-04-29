@@ -1,0 +1,164 @@
+name: Doctor regression smoke
+
+# Builds the wheel from src, installs it in a fresh venv on Linux + macOS,
+# runs `reflex doctor`, asserts it exits 0 + emits the expected platform-
+# specific check signals. Catches install-chain regressions like the v0.7.0
+# LD_LIBRARY_PATH bug where the doctor would crash silently — caught by Modal
+# A10G validation only because of an explicit hardware-matrix fire ($4 of Modal
+# time). This workflow runs that same exit-0 contract for free on every PR.
+#
+# Why this exists:
+# - v0.5.0 silently shipped a stale __version__ in __init__.py until v0.5.4
+#   (caught by users, not CI)
+# - v0.7.0 silently shipped without LD_LIBRARY_PATH paths actually being applied
+#   to the dynamic loader (caught by Modal A10G validation, not CI)
+# - The cost-per-bug pattern is the same: catch in CI ($0) or catch on user's
+#   machine ($X depending on the user — Rob's Blackwell debug took 90+ min).
+#
+# What this validates:
+# - Wheel builds cleanly via pyproject-build (catches hatchling metadata regressions)
+# - Wheel installs cleanly into a fresh Python via pip (catches dependency-resolution issues)
+# - `reflex --version` prints the version from pyproject.toml (catches stale __version__)
+# - `reflex doctor` exits 0 (catches doctor crashes — the v0.7.0 bug type)
+# - `reflex doctor` emits the expected version line + warning shape per platform
+#   (sanity check that the doctor table renders without Rich markup eating brackets)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+  release:
+    types: [published]
+
+jobs:
+  doctor-smoke:
+    name: doctor (${{ matrix.os }} py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Read pyproject version
+        id: version
+        shell: bash
+        run: |
+          # Extract version from pyproject.toml (must match __init__.py)
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])" 2>/dev/null || \
+                   python -c "import tomli; print(tomli.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "expected=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Expected version: $VERSION"
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip build
+          rm -rf dist
+          python -m build --wheel --sdist
+          ls -la dist/
+
+      - name: Install wheel in fresh venv (base extras only)
+        shell: bash
+        run: |
+          python -m venv /tmp/reflex-doctor-venv
+          /tmp/reflex-doctor-venv/bin/python -m pip install --upgrade pip
+          # Install with [onnx] extra — minimal serve dependency surface that
+          # exercises the LD_LIBRARY_PATH patch path without pulling tensorrt
+          # (which has no Mac wheel and is huge on Linux). Doctor should still
+          # exit 0 with TRT libs ⚠ NOT installed warnings.
+          /tmp/reflex-doctor-venv/bin/python -m pip install "$(ls dist/reflex_vla-*.whl)[onnx]"
+
+      - name: Verify reflex --version matches pyproject.toml
+        shell: bash
+        run: |
+          REPORTED=$(/tmp/reflex-doctor-venv/bin/reflex --version 2>&1 | tr -d '[:space:]')
+          EXPECTED=${{ steps.version.outputs.expected }}
+          echo "Reported: $REPORTED"
+          echo "Expected: $EXPECTED"
+          # Tolerate "reflex 0.7.1" or just "0.7.1" — match the version digits
+          if ! echo "$REPORTED" | grep -qF "$EXPECTED"; then
+            echo "FAIL: reflex --version output does not contain $EXPECTED"
+            exit 1
+          fi
+          echo "PASS: --version output contains expected version"
+
+      - name: Run reflex doctor (must exit 0)
+        shell: bash
+        run: |
+          /tmp/reflex-doctor-venv/bin/reflex doctor 2>&1 | tee /tmp/doctor.log
+          DOCTOR_EXIT=${PIPESTATUS[0]}
+          echo "EXIT: $DOCTOR_EXIT"
+          if [ "$DOCTOR_EXIT" -ne 0 ]; then
+            echo "FAIL: reflex doctor exited $DOCTOR_EXIT (expected 0)"
+            exit 1
+          fi
+          echo "PASS: reflex doctor exited 0"
+
+      - name: Assert doctor table rendered + version line present
+        shell: bash
+        run: |
+          # Sanity: doctor should mention the package + the version. Catches
+          # Rich-markup regressions where bracketed text ([serve,gpu]) gets
+          # eaten by the parser (the v0.7.0 doctor bug).
+          if ! grep -qE "reflex-vla.*${{ steps.version.outputs.expected }}" /tmp/doctor.log; then
+            echo "FAIL: doctor output missing 'reflex-vla' version line for ${{ steps.version.outputs.expected }}"
+            grep -i "reflex-vla" /tmp/doctor.log || true
+            exit 1
+          fi
+          # Doctor should always render the table header + Python version row
+          if ! grep -qE "Python version" /tmp/doctor.log; then
+            echo "FAIL: doctor output missing 'Python version' row"
+            exit 1
+          fi
+          echo "PASS: doctor table rendered + version line present"
+
+      - name: Platform-specific assertions — macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Mac path expectations: TRT/CUDA libs ⚠ NOT installed (no Mac wheel),
+          # ORT-TRT EP check skipped, Platform Darwin ✓
+          if ! grep -qE "Platform.*Darwin" /tmp/doctor.log; then
+            echo "FAIL: macOS doctor output missing 'Platform Darwin'"
+            exit 1
+          fi
+          if ! grep -qE "libnvinfer" /tmp/doctor.log; then
+            echo "FAIL: macOS doctor output missing libnvinfer check (regression in TRT EP check rendering)"
+            exit 1
+          fi
+          echo "PASS: macOS-specific assertions"
+
+      - name: Platform-specific assertions — Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Linux CPU path expectations: Platform Linux ✓, libnvinfer ⚠ NOT installed
+          # (because we installed [onnx] not [serve,gpu]), torch + CUDA available=False
+          # (no GPU on free GHA runners), ORT-TRT EP check skipped or deferred.
+          if ! grep -qE "Platform.*Linux" /tmp/doctor.log; then
+            echo "FAIL: Linux doctor output missing 'Platform Linux'"
+            exit 1
+          fi
+          if ! grep -qE "libnvinfer" /tmp/doctor.log; then
+            echo "FAIL: Linux doctor output missing libnvinfer check"
+            exit 1
+          fi
+          echo "PASS: Linux-specific assertions"
+
+      - name: Upload doctor log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doctor-log-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: /tmp/doctor.log
+          retention-days: 7
