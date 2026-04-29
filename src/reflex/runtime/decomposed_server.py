@@ -105,6 +105,16 @@ class Pi05DecomposedServer:
         # action distribution it was trained on. Set via set_a2c2_hook() from
         # create_app at lifespan time. None = no A2C2 (default).
         self._a2c2_hook: Any = None
+        # BID (Bidirectional Decoding) chunk-selection config — alternative to
+        # A2C2 head. Set via set_bid_config() from create_app at lifespan time.
+        # None = no BID (default; single-sample inference path). Mutually
+        # exclusive with _a2c2_hook in Phase 1; create_app validates the
+        # mutex at startup.
+        self._bid_config: Any = None
+        # Per-server previous-chunk buffer for BID coherence scoring. Holds
+        # the last emitted (post-denorm? no — pre-denorm) chunk so the next
+        # call can score candidates against it. Reset to None on cold-start.
+        self._bid_previous_chunk: np.ndarray | None = None
         self._split_orchestrator = None
         self._last_good_actions: np.ndarray | None = None
         self._deadline_misses = 0
@@ -575,18 +585,54 @@ class Pi05DecomposedServer:
             # 3. State pad
             state_arr = self._prep_state(state)
 
-            # 4. Sample noise
-            noise = np.random.randn(
-                1, self.chunk_size, self.max_action_dim,
-            ).astype(np.float32)
+            # 4. Inference path — single-sample (default) or BID multi-sample.
+            bid_telemetry: dict[str, Any] | None = None
+            if self._bid_config is not None:
+                # BID: sample N candidate chunks (varying noise per call),
+                # score each by backward coherence with the previously-emitted
+                # chunk, pick the highest-scoring one. Per
+                # 2026-04-29-a2c2-correction_research_revisit Lens 4 (BID is
+                # the architectural pivot after Phases 1-3 of head-correction
+                # hit the magnitude/derailment ceiling).
+                from reflex.correction.bid import predict_chunk_bid
 
-            # 5. Inference
-            actions_padded = self._inference.predict_action_chunk(
-                img_base=img_base, img_wrist_l=img_wrist_l, img_wrist_r=img_pad,
-                mask_base=mask_base, mask_wrist_l=mask_wrist_l, mask_wrist_r=mask_pad,
-                lang_tokens=lang_tokens, lang_masks=lang_masks,
-                noise=noise, state=state_arr,
-            )
+                rng = np.random.default_rng()  # nondeterministic per call
+
+                def _sample_one(_i: int) -> np.ndarray:
+                    noise_i = rng.standard_normal(
+                        (1, self.chunk_size, self.max_action_dim)
+                    ).astype(np.float32)
+                    out = self._inference.predict_action_chunk(
+                        img_base=img_base, img_wrist_l=img_wrist_l, img_wrist_r=img_pad,
+                        mask_base=mask_base, mask_wrist_l=mask_wrist_l, mask_wrist_r=mask_pad,
+                        lang_tokens=lang_tokens, lang_masks=lang_masks,
+                        noise=noise_i, state=state_arr,
+                    )
+                    if out.ndim == 3:
+                        out = out[0]
+                    return out
+
+                chosen, bid_telemetry = predict_chunk_bid(
+                    _sample_one,
+                    previous_chunk=self._bid_previous_chunk,
+                    config=self._bid_config,
+                )
+                # chosen is shape (chunk_size, max_action_dim); restore the
+                # batch dim so downstream postprocess code sees same shape.
+                actions_padded = chosen[np.newaxis, ...]
+                # Save for next call's coherence scoring.
+                self._bid_previous_chunk = chosen.copy()
+            else:
+                # Single-sample (default).
+                noise = np.random.randn(
+                    1, self.chunk_size, self.max_action_dim,
+                ).astype(np.float32)
+                actions_padded = self._inference.predict_action_chunk(
+                    img_base=img_base, img_wrist_l=img_wrist_l, img_wrist_r=img_pad,
+                    mask_base=mask_base, mask_wrist_l=mask_wrist_l, mask_wrist_r=mask_pad,
+                    lang_tokens=lang_tokens, lang_masks=lang_masks,
+                    noise=noise, state=state_arr,
+                )
 
             # 5b. A2C2 hook -- applied in NORMALIZED action space (between
             # inference output and denorm step), because the head was trained
@@ -636,6 +682,18 @@ class Pi05DecomposedServer:
             }
             if a2c2_decision_meta is not None:
                 result_dict.update(a2c2_decision_meta)
+            if bid_telemetry is not None:
+                # Lift BID telemetry into the response with prefixed keys so
+                # downstream JSONL recorders can grep + plot per-call.
+                result_dict["bid_selected_idx"] = bid_telemetry["selected_idx"]
+                result_dict["bid_n_candidates"] = bid_telemetry["n_candidates"]
+                # Don't include full scores list per-call — too verbose.
+                # Operators can pull from logs if needed.
+                if bid_telemetry["scores"]:
+                    result_dict["bid_top_score"] = float(max(bid_telemetry["scores"]))
+                    result_dict["bid_score_spread"] = float(
+                        max(bid_telemetry["scores"]) - min(bid_telemetry["scores"])
+                    )
             return result_dict
         except Exception as exc:  # noqa: BLE001
             logger.exception("Pi05DecomposedServer.predict failed")
@@ -655,6 +713,36 @@ class Pi05DecomposedServer:
                 "normalized action space before denorm). action_dim=%d, "
                 "obs_dim=%d", hook.head.config.action_dim, hook.head.config.obs_dim,
             )
+
+    def set_bid_config(self, config: Any) -> None:
+        """Bind a BIDConfig to use Bidirectional Decoding for chunk selection
+        during _predict. Per arxiv 2408.17355 + the 2026-04-29 a2c2-correction
+        research-revisit Lens 4. Sample N candidates per /act, score by
+        backward coherence with the previously-emitted chunk, pick best.
+
+        Mutually exclusive with set_a2c2_hook (Phase 1). Setting None disables
+        BID and reverts to the single-sample inference path.
+        """
+        self._bid_config = config
+        # Reset previous_chunk on (re)config so we don't score against a stale
+        # chunk from a different episode/embodiment.
+        self._bid_previous_chunk = None
+        if config is not None:
+            if self._a2c2_hook is not None:
+                logger.warning(
+                    "BID config set while A2C2 hook is also bound — Phase 1 "
+                    "treats these as mutually exclusive; BID will run, A2C2 "
+                    "hook output will be ignored on this server."
+                )
+            logger.info(
+                "Pi05DecomposedServer BID enabled: n_candidates=%d, "
+                "coherence_window=%d, metric=%s",
+                config.n_candidates, config.coherence_window, config.coherence_metric,
+            )
+
+    def reset_bid_state(self) -> None:
+        """Reset the previous-chunk buffer (e.g., on episode boundary)."""
+        self._bid_previous_chunk = None
 
     def _apply_a2c2_normalized(self, actions_padded: np.ndarray) -> dict[str, Any]:
         """Apply A2C2 hook on the chunk in NORMALIZED space.

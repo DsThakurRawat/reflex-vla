@@ -39,6 +39,7 @@ import subprocess
 import modal
 
 app = modal.App("reflex-libero-via-reflex-serve")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _hf_secret():
@@ -114,13 +115,37 @@ image = (
         "LIBERO_BASE": "/tmp/libero_data",
         "PYTHONPATH": "/opt/LIBERO",
     })
+    # Mount local reflex-vla source instead of pulling from git+https. Removes
+    # the dependency on a workspace-level github-token Modal secret (every
+    # fresh Modal account otherwise needs the secret added at
+    # https://modal.com/secrets/<workspace>/main/create?secret_name=github-token
+    # before the first run can succeed). add_local_dir picks up local edits
+    # immediately — no git push needed before modal run.
+    .add_local_dir(
+        os.path.join(REPO_ROOT, "src"),
+        remote_path="/root/reflex-vla/src",
+        copy=True,
+        ignore=["**/__pycache__/**", "**/*.pyc"],
+    )
+    .add_local_file(
+        os.path.join(REPO_ROOT, "pyproject.toml"),
+        remote_path="/root/reflex-vla/pyproject.toml",
+        copy=True,
+    )
+    .add_local_file(
+        os.path.join(REPO_ROOT, "README.md"),
+        remote_path="/root/reflex-vla/README.md",
+        copy=True,
+    )
+    .add_local_file(
+        os.path.join(REPO_ROOT, "LICENSE"),
+        remote_path="/root/reflex-vla/LICENSE",
+        copy=True,
+    )
     .run_commands(
         "mkdir -p /tmp/libero_data",
-        # Bust the layer cache so reflex-vla pip install picks up the
-        # latest SHA on every modal run.
         f'echo "build_bust={_BUILD_BUST}"',
-        f'pip install "reflex-vla[serve,gpu] @ git+https://x-access-token:$GITHUB_TOKEN@github.com/rylinjames/reflex-vla@{_HEAD}"',
-        secrets=[modal.Secret.from_name("github-token")],
+        'pip install -e "/root/reflex-vla[serve,gpu]"',
     )
 )
 
