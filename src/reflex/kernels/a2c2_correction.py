@@ -35,6 +35,14 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# Output saturation scale (tanh(z/scale) * scale) per
+# 2026-04-29-a2c2-correction_research_revisit. Bounds head output to
+# [-3, 3] in normalized action space, matching typical pi0.5 action
+# 3σ range. Prevents the magnitude-7 catastrophe observed in the
+# 2026-04-26 N=50 LIBERO run while preserving zero-init cold-start.
+OUTPUT_SATURATION_SCALE = 3.0
+
+
 # Default architectural constants — tuned to the paper's ~100 KB target.
 # 3 hidden layers × 128 dim ≈ 96 KB at FP32; 50% margin under the 150 KB
 # ceiling enforced by test_a2c2_checkpoint_size().
@@ -227,8 +235,15 @@ class A2C2Head:
             x = self._weights[i] @ x + self._biases[i]
             x = _gelu(x)
 
-        # Output layer (no activation — residual correction can be any sign).
-        correction = self._weights[-1] @ x + self._biases[-1]
+        # Output layer with bounded saturation. Per
+        # 2026-04-29-a2c2-correction_research_revisit (Lens 2 root cause):
+        # an unbounded output + MSE loss let the head emit magnitude-7
+        # corrections that systematically derail the policy. Saturating
+        # to ±3.0 in normalized action space (matching typical action
+        # range ~3σ) prevents the catastrophic failure mode while
+        # preserving the zero-init cold-start invariant (tanh(0)=0).
+        z_out = self._weights[-1] @ x + self._biases[-1]
+        correction = np.tanh(z_out / OUTPUT_SATURATION_SCALE) * OUTPUT_SATURATION_SCALE
         return correction
 
     def to_checkpoint_dict(self) -> dict[str, np.ndarray]:

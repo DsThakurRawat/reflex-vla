@@ -298,6 +298,26 @@ class A2C2Hook:
             total_sq += float(np.sum(correction * correction))
 
         magnitude = float(np.sqrt(total_sq))
+
+        # Safety net per 2026-04-29-a2c2-correction_research_revisit:
+        # the bounded-output head should keep magnitude under
+        # CHUNK_MAGNITUDE_SAFETY_LIMIT (sqrt(chunk_size) * 3.0 — the
+        # theoretical max from per-step ±3.0 saturation). If a future
+        # head somehow exceeds that ceiling (e.g., bypasses tanh during
+        # training, or floating-point edge cases), refuse the correction
+        # rather than risking the magnitude-7 catastrophe re-occurring.
+        chunk_safety_limit = (chunk_size ** 0.5) * 3.0
+        if magnitude > chunk_safety_limit:
+            logger.warning(
+                "a2c2.magnitude_safety_skip: chunk_magnitude=%.2f exceeds "
+                "limit=%.2f (chunk_size=%d); falling back to base actions",
+                magnitude, chunk_safety_limit, chunk_size,
+            )
+            with self._lock:
+                self._skipped_total += 1
+            _emit_a2c2_metric(applied=False, reason="magnitude_safety_skip")
+            return actions, decision, 0.0
+
         with self._lock:
             self._applied_total += 1
         _emit_a2c2_metric(applied=True, reason="applied")

@@ -28,7 +28,20 @@ from typing import Any
 
 import numpy as np
 
-from reflex.kernels.a2c2_correction import A2C2Config, A2C2Head, positional_encoding
+from reflex.kernels.a2c2_correction import (
+    OUTPUT_SATURATION_SCALE,
+    A2C2Config,
+    A2C2Head,
+    positional_encoding,
+)
+
+
+# Phase 1 loss fixes per 2026-04-29-a2c2-correction_research_revisit.
+# Huber δ caps gradient on outliers; L2 magnitude penalty discourages
+# the head from learning large-magnitude residuals to fit the tail of
+# the target distribution.
+HUBER_DELTA = 0.1
+L2_MAGNITUDE_PENALTY = 0.01
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +138,11 @@ def _forward_batch(
         pre_activations.append(z)
         h = _gelu(z)
         activations.append(h)
-    correction = h @ head._weights[-1].T + head._biases[-1]
+    # Output layer + bounded saturation. The pre-saturation z_out is not
+    # stored separately; the backward pass recovers d/dz from the post-tanh
+    # correction directly via 1 - (correction/scale)^2.
+    z_out = h @ head._weights[-1].T + head._biases[-1]
+    correction = np.tanh(z_out / OUTPUT_SATURATION_SCALE) * OUTPUT_SATURATION_SCALE
     return correction, activations, pre_activations
 
 
@@ -136,19 +153,48 @@ def _backward_batch(
     correction: np.ndarray,
     target: np.ndarray,
 ) -> tuple[float, list[np.ndarray], list[np.ndarray]]:
-    """Compute gradients of mean-MSE loss wrt all weights and biases.
+    """Compute gradients wrt all weights and biases.
 
-    Loss = 0.5 * mean(||correction - target||^2)
-    Returns: (loss_value, grad_weights, grad_biases) with the same length as
-    head._weights / head._biases.
+    Loss per 2026-04-29 research-revisit:
+        Huber(diff, δ=HUBER_DELTA) summed over action_dim, mean over batch
+      + L2_MAGNITUDE_PENALTY * mean(||correction||^2)
+
+    Backprop accounts for the tanh saturation on the output layer
+    (correction = scale * tanh(z_out/scale)). Returns: (loss_value,
+    grad_weights, grad_biases) with the same length as head._weights /
+    head._biases.
     """
     cfg = head.config
     n = correction.shape[0]
-    diff = correction - target  # (N, action_dim)
-    loss = 0.5 * float(np.mean(np.sum(diff * diff, axis=-1)))
+    diff = correction - target  # (N, action_dim) — diff in post-tanh space
 
-    # Output layer
-    grad_out = diff / n  # (N, action_dim)
+    # Huber loss (per-element, summed over action_dim, mean over batch).
+    abs_diff = np.abs(diff)
+    huber = np.where(
+        abs_diff < HUBER_DELTA,
+        0.5 * diff * diff,
+        HUBER_DELTA * (abs_diff - 0.5 * HUBER_DELTA),
+    )
+    loss_huber = float(np.mean(np.sum(huber, axis=-1)))
+
+    # L2 magnitude penalty on correction. Discourages the tail of the
+    # target distribution from training the head toward large outputs.
+    loss_mag = L2_MAGNITUDE_PENALTY * float(np.mean(np.sum(correction * correction, axis=-1)))
+    loss = loss_huber + loss_mag
+
+    # Gradient wrt correction (post-tanh):
+    #   ∂Huber/∂correction = clip(diff, ±δ)
+    #   ∂(λ‖correction‖²)/∂correction = 2λ * correction
+    grad_huber = np.where(abs_diff < HUBER_DELTA, diff, HUBER_DELTA * np.sign(diff))
+    grad_mag = 2.0 * L2_MAGNITUDE_PENALTY * correction
+    grad_corr = (grad_huber + grad_mag) / n  # (N, action_dim)
+
+    # Backprop through tanh saturation: d(scale * tanh(z/scale))/dz =
+    # 1 - tanh²(z/scale) = 1 - (correction/scale)².
+    saturation_factor = 1.0 - (correction / OUTPUT_SATURATION_SCALE) ** 2
+    grad_out = grad_corr * saturation_factor  # (N, action_dim) — wrt z_out
+
+    # Output layer (now uses post-tanh-backprop grad_out).
     h_last = activations[-1]  # (N, hidden_dim)
     grad_w_out = grad_out.T @ h_last  # (action_dim, hidden_dim)
     grad_b_out = grad_out.sum(axis=0)  # (action_dim,)
@@ -320,12 +366,21 @@ def train_a2c2_head(
             opt.step(params, grads)
             train_losses.append(loss)
 
-        # Validation
+        # Validation — same loss formula as training (Huber + L2 mag
+        # penalty) so train/val are directly comparable.
         x_v = x_all[val_idx]
         y_v = y_all[val_idx]
         pred_v, _, _ = _forward_batch(head, x_v)
         diff_v = pred_v - y_v
-        val_loss = 0.5 * float(np.mean(np.sum(diff_v * diff_v, axis=-1)))
+        abs_v = np.abs(diff_v)
+        huber_v = np.where(
+            abs_v < HUBER_DELTA,
+            0.5 * diff_v * diff_v,
+            HUBER_DELTA * (abs_v - 0.5 * HUBER_DELTA),
+        )
+        loss_huber_v = float(np.mean(np.sum(huber_v, axis=-1)))
+        loss_mag_v = L2_MAGNITUDE_PENALTY * float(np.mean(np.sum(pred_v * pred_v, axis=-1)))
+        val_loss = loss_huber_v + loss_mag_v
         train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
         metrics["epochs"].append(
             {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}

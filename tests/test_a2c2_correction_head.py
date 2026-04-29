@@ -279,3 +279,54 @@ def test_checkpoint_preserves_config():
         head.save(ckpt)
         loaded = A2C2Head.from_checkpoint(ckpt)
         assert loaded.config == cfg
+
+
+# ---------------------------------------------------------------------------
+# Bounded-output saturation (2026-04-29 research-revisit Phase 1 fix)
+# ---------------------------------------------------------------------------
+
+
+def _fixture_inputs(action_dim: int = 7, obs_dim: int = 256, chunk_size: int = 50):
+    rng = np.random.default_rng(0)
+    return {
+        "base_action": rng.standard_normal(action_dim).astype(np.float32),
+        "observation": rng.standard_normal(obs_dim).astype(np.float32),
+        "chunk_position": 5,
+        "latency_estimate_ms": 50.0,
+    }
+
+
+def test_forward_output_bounded_to_saturation_scale():
+    """Phase 1 fix: head output must lie in [-3, 3] (OUTPUT_SATURATION_SCALE).
+    Catches the magnitude-7 catastrophe the 2026-04-26 N=50 LIBERO run hit
+    if a future change accidentally bypasses the tanh saturation."""
+    from reflex.kernels.a2c2_correction import OUTPUT_SATURATION_SCALE
+
+    rng = np.random.default_rng(0)
+    head = A2C2Head.random_init(seed=42)
+    # Even with random inputs designed to push the head toward extremes,
+    # the output must remain bounded by the saturation scale.
+    for trial in range(20):
+        inputs = {
+            "base_action": rng.standard_normal(head.config.action_dim).astype(np.float32) * 5.0,
+            "observation": rng.standard_normal(head.config.obs_dim).astype(np.float32) * 5.0,
+            "chunk_position": rng.integers(0, head.config.chunk_size),
+            "latency_estimate_ms": float(rng.uniform(0, 500)),
+        }
+        out = head.forward(**inputs)
+        assert np.all(np.abs(out) <= OUTPUT_SATURATION_SCALE + 1e-5), (
+            f"trial {trial}: output {out} exceeds saturation scale "
+            f"{OUTPUT_SATURATION_SCALE}"
+        )
+
+
+def test_forward_zero_init_still_emits_zero_correction():
+    """Phase 1 invariant: zero-init output layer must still emit zero
+    correction (tanh(0)=0). This preserves the cold-start safety property."""
+    cfg = A2C2Config()
+    head = A2C2Head.random_init(cfg, seed=0)
+    # Zero out the output layer manually (simulates zero-init from training)
+    head._weights[-1] = np.zeros_like(head._weights[-1])
+    head._biases[-1] = np.zeros_like(head._biases[-1])
+    out = head.forward(**_fixture_inputs(cfg.action_dim, cfg.obs_dim, cfg.chunk_size))
+    assert np.all(np.abs(out) < 1e-6), f"zero-init head emitted non-zero correction: {out}"
