@@ -182,6 +182,9 @@ def libero_via_serve(
     a2c2_latency_threshold_ms: float = 40.0,
     a2c2_success_threshold: float = 0.90,
     inject_latency_ms: float = 0.0,
+    bid_n_candidates: int = 0,
+    bid_coherence_window: int = 5,
+    bid_coherence_metric: str = "l2",
     seed: int = 7,
     serve_health_timeout_s: int = 480,
     serve_port: int = 8000,
@@ -243,6 +246,10 @@ def libero_via_serve(
         serve_cmd.extend(["--a2c2-success-threshold", str(a2c2_success_threshold)])
     if inject_latency_ms > 0:
         serve_cmd.extend(["--inject-latency-ms", str(int(inject_latency_ms))])
+    if bid_n_candidates > 0:
+        serve_cmd.extend(["--bid-num-candidates", str(int(bid_n_candidates))])
+        serve_cmd.extend(["--bid-coherence-window", str(int(bid_coherence_window))])
+        serve_cmd.extend(["--bid-coherence-metric", bid_coherence_metric])
 
     print(f"[libero_via_serve] starting: {' '.join(serve_cmd)}")
     serve_proc = subprocess.Popen(
@@ -479,6 +486,9 @@ def main(
     a2c2_latency_threshold_ms: float = 40.0,
     a2c2_success_threshold: float = 0.90,
     inject_latency_ms: float = 0.0,
+    bid_n_candidates: int = 0,
+    bid_coherence_window: int = 5,
+    bid_coherence_metric: str = "l2",
 ):
     """Run LIBERO via reflex serve.
 
@@ -489,6 +499,7 @@ def main(
     --a2c2-success-threshold 1.01  disable success-based skip (for measurement)
     --a2c2-latency-threshold-ms 0  disable latency-based skip (force-apply)
     --inject-latency-ms 100  synthetic latency for A2C2 measurement (ADR 2026-04-24)
+    --bid-n-candidates 8  enable BID chunk selection (mutex with a2c2_checkpoint in Phase 1)
     """
     if tasks == "all":
         task_list = None
@@ -506,6 +517,9 @@ def main(
         a2c2_latency_threshold_ms=a2c2_latency_threshold_ms,
         a2c2_success_threshold=a2c2_success_threshold,
         inject_latency_ms=inject_latency_ms,
+        bid_n_candidates=bid_n_candidates,
+        bid_coherence_window=bid_coherence_window,
+        bid_coherence_metric=bid_coherence_metric,
     )
     print("\n=== RESULT ===")
     if r.get("status") == "fail":

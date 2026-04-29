@@ -1600,6 +1600,28 @@ def serve(
              "for default behavior or set to 1.01 to disable success-skip "
              "for measurement runs.",
     ),
+    bid_n_candidates: int = typer.Option(
+        0,
+        "--bid-num-candidates",
+        help="Enable Bidirectional Decoding (BID) chunk selection per arxiv "
+             "2408.17355. Sample N candidate chunks per /act + pick the one "
+             "most coherent with the previously-emitted chunk. 0 (default) "
+             "= disabled (single-sample inference). Recommended: 8 for "
+             "balance between selection quality + Nx denoise cost. Mutually "
+             "exclusive with --a2c2-checkpoint in Phase 1; both set = BID wins.",
+    ),
+    bid_coherence_window: int = typer.Option(
+        5,
+        "--bid-coherence-window",
+        help="Window size K: BID scores first K actions of new chunk vs "
+             "last K actions of previous chunk. Default 5 per the paper.",
+    ),
+    bid_coherence_metric: str = typer.Option(
+        "l2",
+        "--bid-coherence-metric",
+        help="BID coherence scoring metric: 'l2' (default; lower L2 distance "
+             "wins) or 'cos' (higher cosine similarity wins).",
+    ),
     cuda_graphs: bool = typer.Option(
         False,
         "--cuda-graphs",
@@ -1986,6 +2008,9 @@ def serve(
         a2c2_checkpoint=a2c2_checkpoint or None,
         a2c2_latency_threshold_ms=a2c2_latency_threshold_ms,
         a2c2_success_threshold=a2c2_success_threshold,
+        bid_n_candidates=bid_n_candidates,
+        bid_coherence_window=bid_coherence_window,
+        bid_coherence_metric=bid_coherence_metric,
         auto_calibrate=auto_calibrate,
         calibration_cache_path=str(_calib_cache_path) if _calib_cache_path else None,
         calibrate_force=calibrate_force,

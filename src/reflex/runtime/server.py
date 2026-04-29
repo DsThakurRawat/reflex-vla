@@ -1164,6 +1164,14 @@ def create_app(
     a2c2_checkpoint: str | None = None,  # path to .npz A2C2 head; None disables A2C2
     a2c2_latency_threshold_ms: float = 40.0,  # hook auto-skip when latency_p95 < this (ms)
     a2c2_success_threshold: float = 0.90,  # hook auto-skip when /act success rate > this; set to 1.01 to disable
+    # BID (Bidirectional Decoding) — alternative to A2C2 head per arxiv
+    # 2408.17355 + 2026-04-29 a2c2-correction research-revisit Lens 4. When
+    # bid_n_candidates > 0, server samples N chunks per /act + picks best
+    # via backward coherence with previously-emitted chunk. Mutually
+    # exclusive with a2c2_checkpoint in Phase 1; create_app warns if both set.
+    bid_n_candidates: int = 0,  # 0 = BID disabled (default); 2-32 = enable
+    bid_coherence_window: int = 5,  # how many trailing actions of prev chunk to score against
+    bid_coherence_metric: str = "l2",  # 'l2' or 'cos'
     auto_calibrate: bool = False,  # Phase 1 auto-calibration opt-in
     calibration_cache_path: str | None = None,  # path to ~/.reflex/calibration.json
     calibrate_force: bool = False,  # ignore cache hit, re-run measurement
@@ -1543,6 +1551,44 @@ def create_app(
             )
             server.a2c2_hook = None  # type: ignore[attr-defined]
             server.a2c2_internal = False  # type: ignore[attr-defined]
+    # BID (Bidirectional Decoding) chunk-selection. Per the 2026-04-29
+    # research-revisit Lens 4: alternative to A2C2 head correction. Sample
+    # N candidates per /act + pick best via backward coherence. Mutex with
+    # A2C2 hook in Phase 1.
+    if bid_n_candidates > 0:
+        try:
+            from reflex.correction.bid import BIDConfig
+            _bid_cfg = BIDConfig(
+                n_candidates=int(bid_n_candidates),
+                coherence_window=int(bid_coherence_window),
+                coherence_metric=str(bid_coherence_metric),
+            )
+            if hasattr(server, "set_bid_config"):
+                server.set_bid_config(_bid_cfg)  # type: ignore[attr-defined]
+                logger.info(
+                    "BID enabled on server: N=%d, window=%d, metric=%s",
+                    _bid_cfg.n_candidates, _bid_cfg.coherence_window,
+                    _bid_cfg.coherence_metric,
+                )
+                if a2c2_checkpoint:
+                    logger.warning(
+                        "Both --bid-num-candidates and --a2c2-checkpoint set; "
+                        "Phase 1 treats these as mutually exclusive. BID will "
+                        "run; A2C2 head output ignored."
+                    )
+            else:
+                logger.warning(
+                    "--bid-num-candidates=%d set but server type %s does not "
+                    "support BID (only Pi05DecomposedServer wires it today). "
+                    "Request behavior unchanged.",
+                    bid_n_candidates, type(server).__name__,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to configure BID (n=%d): %s — falling back to single-sample",
+                bid_n_candidates, exc,
+            )
+
     # The cuda_graphs_enabled flag is consumed by Pi05DecomposedInference when
     # that backend is instantiated (scripts/modal_*_decomposed.py paths, and
     # future production wiring once chunk-budget-batching lands the decomposed-
