@@ -119,7 +119,12 @@ image = (
         "cmake .. -GNinja "
         "  -DCMAKE_BUILD_TYPE=Release "
         "  -DCMAKE_CUDA_ARCHITECTURES=89 "
-        "  -DENABLE_FA2=ON && "
+        "  -DENABLE_FA2=ON "
+        # FA2_ARCH_NATIVE_ONLY=ON skips sm_80 + compute_120 PTX AOT path.
+        # Required because our CUDA 12.5 image's nvcc doesn't support
+        # compute_120 (Blackwell needs CUDA 12.8+). Documented at
+        # FlashRT/CMakeLists.txt:93.
+        "  -DFA2_ARCH_NATIVE_ONLY=ON && "
         "ninja -j$(nproc) && "
         f"cd {FLASHRT_DIR} && pip install -e '.[torch]'",
         gpu="L40S",  # cmake reads $CUDA_ARCH_LIST + needs nvcc; build on GPU
