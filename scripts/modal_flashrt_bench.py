@@ -140,9 +140,18 @@ image = (
     # Late-stage deps that aren't in FlashRT's pyproject extras.
     # Kept in a separate pip_install AFTER the run_commands so adding
     # them doesn't invalidate the expensive FA2 build cache.
-    # ml_dtypes is required by flash_vla.models.pi05.pipeline_rtx (line 45);
-    # surfaced via v5's GPU_FAIL.
-    .pip_install("ml_dtypes")
+    #
+    # ml_dtypes — required by flash_vla.models.pi05.pipeline_rtx (line 45);
+    #             surfaced via v5's GPU_FAIL.
+    # flash-attn — required by flash_vla.hardware.rtx.attn_backend (line 354);
+    #             surfaced via v8's GPU_FAIL. Comment in upstream:
+    #             "Always import flash_attn: used either as the full legacy
+    #             backend (when _use_fvk_fa2 is False) or as per-site fallback
+    #             when FVK_RTX_FA2_SITES excludes some sites during bisection."
+    #             Despite us building flash_vla_fa2 successfully (v8 cleared
+    #             the previous blocker), the SM89 codepath still needs
+    #             pip flash-attn for non-vendored attention sites.
+    .pip_install("ml_dtypes", "flash-attn", extra_options="--no-build-isolation")
 )
 
 
