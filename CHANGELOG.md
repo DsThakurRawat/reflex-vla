@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.7.3 — 2026-04-30
+
+Five production-relevant fixes surfaced during per-step expert ONNX export validation work. Each was caught by a parity / latency gate, root-caused, fixed at source. None require user action; benefits show up automatically on `pip install reflex-vla --upgrade` + re-export of any decomposed pi0.5 ONNX.
+
+### Fixed
+
+- **pi0.5 decomposed export precision (cache mutation in trace).** `apply_export_patches` installs a `DynamicLayer.update` freeze patch that prevents the cache from growing across unrolled Euler iterations during torch.export tracing. The flag-toggling wrapper around `denoise_step` was applied to `PI0Pytorch` only — `PI05Pytorch` fell through to the original mutating update, so pi0.5 decomposed exports traced cache growth 968 → 1418 across n=10 with stale-suffix K/V in attention. Promoted `_denoise_phase` flag to module level + wrapped `PI05Pytorch.denoise_step` symmetrically. (Caught by per-step parity gate at cos=0.018; commit `60c30b9`.)
+
+- **Expert ONNX precision (constant-folding sin/cos in fp32).** `torch.onnx.export(dynamo=True, optimize=True)` (the default) constant-folds the time embedding's float64 sin/cos in FP32-precision arithmetic, producing a ~3e-5 max_abs deviation from a true float64 compute. Set `optimize=False` on the expert ONNX export call. Marginal node-count increase, immaterial runtime cost (sin/cos << matmul). (Caught while chasing the residual after the freeze-flag fix; minimal local repro confirmed; commit `d86dca1`.)
+
+- **Reflex CUDA loadchain (libcurand / libcufft / libcusparse).** ORT's `libonnxruntime_providers_cuda.so` links against `libcurand`/`libcufft`/`libcusparse`/`libnvJitLink`. Reflex's `_eager_dlopen_nvidia_libs` only handled cudart/cublas/cudnn + TensorRT — the others happened to be findable on most images via standard `/usr/local/cuda` paths or torch's transitive layout. On Modal images that pinned dependencies tighter (no torch transitively pulling curand), ORT silently fell back to CPU EP and crashed on float64 Cos at the first per-step call. Added the four libs to `_candidate_lib_dirs` + eager-dlopen targets in `src/reflex/__init__.py`. Independently load-bearing for any reflex consumer running on a fresh image. (Caught in gate-4 overhead bench; commit `462c191`.)
+
+- **`--rtc` actually works on decomposed servers.** Pre-fix `--rtc` constructed `RtcAdapter` with `action_buffer=None` whenever the user hadn't also passed `--replan-hz`/`--execute-hz`. `merge_and_update` then raised `'NoneType' object has no attribute peek_all'` on every `/act` call, logged a warning, and silently no-op'd RTC's carry-forward (the inertia mechanism that's the entire point of RTC). Worse: `Pi05DecomposedServer` doesn't have `configure_replan` (only `MonolithicServer` does), so an initial fix that auto-called `configure_replan` only worked for monolithic. Real fix: build the `ActionChunkBuffer` directly when `--rtc` is set and no buffer exists, regardless of server class. Stash on `server._action_buffer`. Decomposed pi0.5 + RTC now actually applies prefix-attention guidance per call. (Caught in gate-6 LIBERO smoke; commits `b863915` then `c059b14`.)
+
+- **Per-step expert ONNX runtime IOBinding.** When `Pi05DecomposedInference` is loaded with a per-step expert ONNX (the new export shape from v0.8.0 per-step expert work), the Python Euler loop calls the expert ONNX N times per chunk. The naive `sess.run(feed_dict)` path forces ORT to re-copy past_kvs (~140 MB across 38 tensors) host→device on every iter — measured at +36% chunk overhead vs baked. ORT IOBinding pins past_kvs + prefix_pad_masks to device once per chunk via `OrtValue.ortvalue_from_numpy(arr, "cuda", 0)`; only x_t (~6 KB) and t (4 B) cross host→device per iter. Drops overhead to +13% (passes the spec gate). Production runtime updated in `Pi05DecomposedInference._run_expert`. (Caught in gate-4 A/B bench; commit `e4b7ca5`.)
+
+### Tests
+
+- Two new receipt-checker tests for the per-step gate sweep:
+  - `tests/test_decomposed_per_step_overhead.py` — asserts IOBinding overhead ≤ +20% / ≤ 1.30x p99, IOBinding strictly faster than naive, CUDA EP active.
+  - `tests/test_decomposed_per_step_e2e_latency.py` — asserts E2E overhead ≤ +20% / ≤ 1.30x, vlm phase wall-time matches across baked vs per-step within 10% (catches if `cudnn_conv_algo_search=HEURISTIC` wasn't pinned).
+- 32/32 per-step gate tests pass locally.
+
+### Notes
+
+- **Existing shipped pi0.5 ONNX files behave the same.** Both the freeze-flag and the optimize=False fixes only affect FUTURE re-exports. Customers who don't re-export keep their current behavior. Re-export gets tighter precision (~10x improvement on baked-loop time-emb).
+- **The freeze-flag fix removes "stale suffix K/V" from attention** in the baked decomposed pi0.5 trace. This is semantically the correct behavior (matches PyTorch eager without the cache-mutation artifact). The previous behavior worked at production because the existing `cuda_runtime_parity` gate uses cos≥0.999 (looser than the 0.99999 the per-step parity gate caught it with).
+- **All 5 fixes were caught + diagnosed in a single session** by the per-step expert ONNX export ship gates (1-6). Total Modal cost across the diagnostic work: ~$28 (vs original $15-22 per-step ship budget). Each overrun was driven by a real bug discovery — not waste.
+- **Per-step expert export feature itself ships in v0.8.0** pending the gate-6 LIBERO RTC regression sweep landing PASS. v0.7.3 covers only the incidental fixes that benefit existing users.
+
 ## v0.7.2 — 2026-04-29
 
 A2C2 correction head Phase 1 fix — eliminates the magnitude-7 catastrophic regression that the 2026-04-26 N=50 LIBERO experiment surfaced. Closes the path to A2C2 production deploy with no risk of policy derailment.
