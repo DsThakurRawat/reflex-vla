@@ -33,6 +33,18 @@ pip install 'reflex-vla[serve,onnx]'              # Mac / CPU runtime
 
 Requires Python ≥ 3.10.
 
+### What's new in v0.7.3 (2026-04-30)
+
+Five production-relevant fixes from per-step expert ONNX export validation work. All take effect on `pip install --upgrade reflex-vla` + a re-export of any decomposed pi0.5 ONNX:
+
+- **pi0.5 decomposed export precision** — freeze-flag for the `DynamicLayer.update` cache mutation, now applied to `PI05Pytorch.denoise_step` (was only applied to pi0). Removes stale-suffix K/V from attention in the baked-loop trace.
+- **Expert ONNX precision** — `optimize=False` on `torch.onnx.export` to skip the constant-folding pass that evaluates fp64 sin/cos in fp32 (3e-5 max_abs error).
+- **CUDA EP loadchain** — eager-dlopen `libcurand` / `libcufft` / `libcusparse` / `libnvJitLink`. Independently load-bearing for any consumer on a fresh image where torch's transitive curand path doesn't happen to be loadable.
+- **`--rtc` actually works on decomposed servers** — pre-fix, `--rtc` constructed `RtcAdapter` with `action_buffer=None` whenever `--replan-hz`/`--execute-hz` weren't also passed, and `merge_and_update` silently no-op'd RTC's carry-forward. Now auto-builds the buffer.
+- **Per-step expert ORT IOBinding** (preview for v0.8.0 per-step export feature) — pin past_kvs to device once per chunk via `OrtValue.ortvalue_from_numpy`. Drops per-step Euler loop overhead from +36% to +13%.
+
+Full per-fix details + commit refs in [CHANGELOG.md](CHANGELOG.md).
+
 ### Upgrading
 
 We ship patches frequently — make sure you're on the latest:
