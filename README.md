@@ -412,3 +412,6 @@ For commercial licensing inquiries (offering Reflex as a hosted service to compe
 ---
 
 Reflex is built by [FastCrest](https://fastcrest.com). No signup, no telemetry by default.
+
+Made with 🔥 Passion in San Francisco
+
