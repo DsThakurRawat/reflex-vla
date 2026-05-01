@@ -100,8 +100,8 @@ image = (
 )
 
 
-N_WARMUP = 5
-N_BENCH = 50
+N_WARMUP = 10
+N_BENCH = 200  # bumped from 50 for tighter p99 + median stability
 
 
 @app.function(
@@ -157,29 +157,61 @@ def e2e_bench() -> dict:
             "noise": r.standard_normal(size=(B, chunk, action_dim)).astype(np.float32),
         }
 
+    # Phase-level timing helper. Calls _get_or_run_prefix + _run_expert
+    # directly to attribute wall-time to each phase. Mirrors the public
+    # predict_action_chunk path for cache_level='none' (skips episode/action
+    # cache short-circuits, runs both phases every call).
+    def time_one_chunk(inf, inputs):
+        # Phase 1: vlm_prefix (the 38 past_kv + prefix_pad_masks computation)
+        t0 = time.perf_counter()
+        past_kv, prefix_pad = inf._get_or_run_prefix(
+            img_base=inputs["img_base"],
+            img_wrist_l=inputs["img_wrist_l"],
+            img_wrist_r=inputs["img_wrist_r"],
+            mask_base=inputs["mask_base"],
+            mask_wrist_l=inputs["mask_wrist_l"],
+            mask_wrist_r=inputs["mask_wrist_r"],
+            lang_tokens=inputs["lang_tokens"],
+            lang_masks=inputs["lang_masks"],
+            image_phashes=(b"x" * 8, b"x" * 8, b"x" * 8),  # cache disabled at level=none
+            lang_hash="x",
+        )
+        t_vlm = (time.perf_counter() - t0) * 1000
+
+        # Phase 2: expert (the per-step Euler loop or baked single call)
+        expert_feed_base = {nm: past_kv[i] for i, nm in enumerate(inf._past_kv_names)}
+        expert_feed_base["prefix_pad_masks"] = prefix_pad
+        t1 = time.perf_counter()
+        _ = inf._run_expert(expert_feed_base, inputs["noise"])
+        t_expert = (time.perf_counter() - t1) * 1000
+
+        return t_vlm + t_expert, t_vlm, t_expert
+
     log.info("Warming up baked (%d iters)", N_WARMUP)
     for i in range(N_WARMUP):
         _ = inf_baked.predict_action_chunk(**make_inputs(seed=i))
 
-    log.info("Benching baked (N=%d)", N_BENCH)
-    baked_times = []
+    log.info("Benching baked (N=%d) with phase breakdown", N_BENCH)
+    baked_times, baked_vlm, baked_expert = [], [], []
     for i in range(N_BENCH):
         inputs = make_inputs(seed=1000 + i)
-        t0 = time.perf_counter()
-        _ = inf_baked.predict_action_chunk(**inputs)
-        baked_times.append((time.perf_counter() - t0) * 1000)
+        total, vlm, exp = time_one_chunk(inf_baked, inputs)
+        baked_times.append(total)
+        baked_vlm.append(vlm)
+        baked_expert.append(exp)
 
     log.info("Warming up per-step (%d iters)", N_WARMUP)
     for i in range(N_WARMUP):
         _ = inf_per_step.predict_action_chunk(**make_inputs(seed=i))
 
-    log.info("Benching per-step (N=%d)", N_BENCH)
-    per_step_times = []
+    log.info("Benching per-step (N=%d) with phase breakdown", N_BENCH)
+    per_step_times, per_step_vlm, per_step_expert = [], [], []
     for i in range(N_BENCH):
         inputs = make_inputs(seed=2000 + i)
-        t0 = time.perf_counter()
-        _ = inf_per_step.predict_action_chunk(**inputs)
-        per_step_times.append((time.perf_counter() - t0) * 1000)
+        total, vlm, exp = time_one_chunk(inf_per_step, inputs)
+        per_step_times.append(total)
+        per_step_vlm.append(vlm)
+        per_step_expert.append(exp)
 
     def stats(arr):
         a = np.array(arr)
@@ -195,24 +227,42 @@ def e2e_bench() -> dict:
 
     baked_stats = stats(baked_times)
     per_step_stats = stats(per_step_times)
+    baked_vlm_stats = stats(baked_vlm)
+    baked_expert_stats = stats(baked_expert)
+    per_step_vlm_stats = stats(per_step_vlm)
+    per_step_expert_stats = stats(per_step_expert)
     median_pct = (per_step_stats["median_ms"] / baked_stats["median_ms"]) - 1.0
     p99_ratio = per_step_stats["p99_ms"] / baked_stats["p99_ms"]
     passes_median = median_pct <= 0.20
     passes_p99 = p99_ratio <= 1.30
     passes_overall = passes_median and passes_p99
 
+    log.info("--- E2E ---")
     log.info("BAKED      median=%.2fms p99=%.2fms", baked_stats["median_ms"], baked_stats["p99_ms"])
     log.info("PER-STEP   median=%.2fms p99=%.2fms", per_step_stats["median_ms"], per_step_stats["p99_ms"])
     log.info("Overhead: median %+.1f%% / p99 %.2fx — gate %s",
              median_pct * 100, p99_ratio, "PASS" if passes_overall else "FAIL")
+    log.info("--- VLM PREFIX phase (should be ~equal across baked/per-step) ---")
+    log.info("BAKED      vlm median=%.2fms p99=%.2fms", baked_vlm_stats["median_ms"], baked_vlm_stats["p99_ms"])
+    log.info("PER-STEP   vlm median=%.2fms p99=%.2fms", per_step_vlm_stats["median_ms"], per_step_vlm_stats["p99_ms"])
+    log.info("--- EXPERT phase ---")
+    log.info("BAKED      exp median=%.2fms p99=%.2fms", baked_expert_stats["median_ms"], baked_expert_stats["p99_ms"])
+    log.info("PER-STEP   exp median=%.2fms p99=%.2fms", per_step_expert_stats["median_ms"], per_step_expert_stats["p99_ms"])
+    expert_median_pct = (per_step_expert_stats["median_ms"] / baked_expert_stats["median_ms"]) - 1.0
+    log.info("Expert overhead median: %+.1f%%", expert_median_pct * 100)
 
     return {
         "n_warmup": N_WARMUP,
         "n_bench": N_BENCH,
         "baked": baked_stats,
         "per_step": per_step_stats,
+        "baked_vlm": baked_vlm_stats,
+        "baked_expert": baked_expert_stats,
+        "per_step_vlm": per_step_vlm_stats,
+        "per_step_expert": per_step_expert_stats,
         "median_overhead_pct": median_pct,
         "p99_ratio": p99_ratio,
+        "expert_median_overhead_pct": expert_median_pct,
         "passes_median_gate": passes_median,
         "passes_p99_gate": passes_p99,
         "passes_overall": passes_overall,
