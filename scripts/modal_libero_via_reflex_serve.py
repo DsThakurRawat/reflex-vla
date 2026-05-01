@@ -165,7 +165,7 @@ TASK_SUITE_MAX_STEPS = {
 @app.function(
     image=image,
     gpu="A100-80GB",
-    timeout=10800,  # 3 hr cap; LIBERO + serve startup + N=50 episodes (longest seen so far ~83 min for libero_object after the 3-fix denorm/prompt/wrist patches)
+    timeout=86400,  # 24 hr Modal max (was 3 hr — bit us 2026-04-30: gate-6 N=20 × 5 tasks × 2 conditions both hit the 3hr cap mid-task-2 with no warning). Per-event logs hide timing pressure; pair with the periodic [progress] emission added below.
     volumes={
         HF_CACHE_PATH: hf_cache,
         ONNX_OUTPUT_PATH: onnx_output,
@@ -360,6 +360,17 @@ def libero_via_serve(
         tasks_to_run = task_indices if task_indices is not None else list(range(num_tasks_in_suite))
         print(f"[libero_via_serve] tasks: {tasks_to_run}")
 
+        # Periodic-progress watchdog. After each episode, emit a one-line
+        # [progress] stat with elapsed-vs-budget so timeout/preemption issues
+        # surface BEFORE the run ends. Per-event 'ep N done' lines hide timing
+        # pressure; this gives Monitor / observers a single-line pace check.
+        # Lesson from 2026-04-30: gate-6 N=20 × 5 tasks × 2 conditions both
+        # hit the 3hr Modal timeout cap mid-task-2 with no warning.
+        # See feedback_modal_periodic_progress_logging memory.
+        run_start_ts = time.time()
+        timeout_budget_s = 86400  # match @app.function(timeout=...)
+        total_expected_eps = num_episodes * len(tasks_to_run)
+
         for task_idx in tasks_to_run:
             task = task_suite.get_task(task_idx)
             task_description = task.language
@@ -446,6 +457,20 @@ def libero_via_serve(
                     results["total_eps"] += 1
                     results["total_steps"] += n_steps
                     print(f"  ep {ep} (init={init_idx}): {'SUCCESS' if done else 'fail'} at {t} steps ({time.time()-task_start:.1f}s total)")
+                    # Periodic progress watchdog: emit pace check vs Modal timeout budget.
+                    elapsed_s = time.time() - run_start_ts
+                    eps_done = results["total_eps"]
+                    if eps_done > 0:
+                        eta_total_s = elapsed_s * total_expected_eps / eps_done
+                        eta_remaining_min = (eta_total_s - elapsed_s) / 60.0
+                        time_pct = 100.0 * elapsed_s / timeout_budget_s
+                        ep_pct = 100.0 * eps_done / total_expected_eps
+                        warn = "WARN_OVER_BUDGET" if (time_pct > 70 and ep_pct < time_pct - 10) else ""
+                        print(
+                            f"  [progress] elapsed={elapsed_s/60:.1f}min ({time_pct:.0f}% of budget) "
+                            f"| done={eps_done}/{total_expected_eps} ({ep_pct:.0f}%) "
+                            f"| ETA={eta_remaining_min:.0f}min {warn}".strip()
+                        )
                 except Exception as exc:
                     err_tb = traceback.format_exc()
                     print(f"  episode error: {exc}")
