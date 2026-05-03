@@ -3620,6 +3620,151 @@ app.add_typer(validate_app, name="validate")
 app.add_typer(inspect_app, name="inspect")
 
 
+# ─── reflex pro {activate, status, deactivate} ──────────────────────────────
+# Customer-facing Pro tier commands. Activation flow lives in
+# src/reflex/pro/activate.py; status reads ~/.reflex/pro.license; deactivate
+# clears the local file (license remains valid server-side until revoked).
+pro_app = typer.Typer(
+    help="Reflex Pro — activate, check, or deactivate your Pro license.",
+    no_args_is_help=True,
+)
+app.add_typer(pro_app, name="pro")
+
+
+@pro_app.command("activate")
+def pro_activate(
+    code: str = typer.Argument(..., help="Activation code (REFLEX-XXXX-XXXX-XXXX) sent by the operator."),
+    endpoint: Optional[str] = typer.Option(
+        None, "--endpoint",
+        help="Override license worker URL. Defaults to REFLEX_LICENSE_ENDPOINT env or production.",
+    ),
+) -> None:
+    """Redeem an activation code: fetch + verify + write the Pro license."""
+    from reflex.pro.activate import (
+        ActivationCodeError,
+        ActivationError,
+        ActivationNetworkError,
+        activate_license,
+    )
+    from reflex.pro.signature import LicenseSignatureError
+
+    try:
+        license = activate_license(code, endpoint=endpoint)
+    except ActivationCodeError as exc:
+        console.print(f"[red]Activation failed:[/red] {exc}")
+        raise typer.Exit(1)
+    except ActivationNetworkError as exc:
+        console.print(f"[red]Network error:[/red] {exc}")
+        raise typer.Exit(2)
+    except LicenseSignatureError as exc:
+        console.print(f"[red]Signature verification failed:[/red] {exc}")
+        console.print("[red]Refusing to write a license that didn't verify.[/red]")
+        raise typer.Exit(3)
+    except ActivationError as exc:
+        console.print(f"[red]Activation error:[/red] {exc}")
+        raise typer.Exit(4)
+
+    console.print("[green]✓[/green] License fetched, signature verified, written to ~/.reflex/pro.license")
+    console.print(f"[green]✓[/green] Hardware bound: gpu_uuid={license.get('hardware_binding', {}).get('gpu_uuid', 'unknown')}")
+    console.print(f"[green]✓[/green] Telemetry: ON by default — disable with [cyan]REFLEX_NO_TELEMETRY=1[/cyan]")
+    console.print()
+    console.print(f"Welcome to Reflex Pro. License [cyan]{license.get('license_id')}[/cyan] expires [cyan]{license.get('expires_at')}[/cyan].")
+    console.print("Run [cyan]reflex pro status[/cyan] anytime to check.")
+
+
+@pro_app.command("status")
+def pro_status(
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON for scripts."),
+) -> None:
+    """Show the current Pro license status (expiry, days remaining, last heartbeat)."""
+    import json as _json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from reflex.pro.activate import DEFAULT_LICENSE_PATH
+
+    path = Path(DEFAULT_LICENSE_PATH).expanduser()
+    if not path.exists():
+        if json_output:
+            print(_json.dumps({"present": False, "path": str(path)}))
+            raise typer.Exit(1)
+        console.print(f"[yellow]No Pro license found at {path}.[/yellow]")
+        console.print("Activate with: [cyan]reflex pro activate <activation_code>[/cyan]")
+        raise typer.Exit(1)
+
+    try:
+        data = _json.loads(path.read_text())
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]License file is corrupt:[/red] {exc}")
+        raise typer.Exit(2)
+
+    expires_at = data.get("expires_at", "")
+    last_hb = data.get("last_heartbeat_at", "")
+    days_remaining = "?"
+    if expires_at:
+        try:
+            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            delta = exp - datetime.now(timezone.utc)
+            days_remaining = max(0, int(delta.total_seconds() // 86400))
+        except Exception:  # noqa: BLE001
+            days_remaining = "?"
+
+    summary = {
+        "present": True,
+        "path": str(path),
+        "license_id": data.get("license_id"),
+        "customer_id": data.get("customer_id"),
+        "tier": data.get("tier"),
+        "license_version": data.get("license_version"),
+        "expires_at": expires_at,
+        "days_remaining": days_remaining,
+        "max_seats": data.get("max_seats"),
+        "last_heartbeat_at": last_hb,
+        "hardware_bound": data.get("hardware_binding") is not None,
+        "signed": bool(data.get("signature")),
+    }
+
+    if json_output:
+        print(_json.dumps(summary, indent=2))
+        return
+
+    console.print(f"[bold]Reflex Pro license:[/bold] {path}")
+    console.print(f"  license_id:    [cyan]{summary['license_id']}[/cyan]")
+    console.print(f"  customer:      {summary['customer_id']}")
+    console.print(f"  tier:          {summary['tier']}")
+    console.print(f"  version:       v{summary['license_version']} ({'signed' if summary['signed'] else 'UNSIGNED — legacy'})")
+    console.print(f"  expires:       {expires_at} ([cyan]{days_remaining} days remaining[/cyan])")
+    console.print(f"  max_seats:     {summary['max_seats']}")
+    console.print(f"  last heartbeat: {last_hb or '[yellow](never)[/yellow]'}")
+    console.print(f"  hardware:      {'bound ✓' if summary['hardware_bound'] else '[yellow]unbound[/yellow]'}")
+
+
+@pro_app.command("deactivate")
+def pro_deactivate(
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip the confirmation prompt."),
+) -> None:
+    """Remove the local Pro license file. Server-side license remains until revoked."""
+    from pathlib import Path
+
+    from reflex.pro.activate import DEFAULT_LICENSE_PATH
+
+    path = Path(DEFAULT_LICENSE_PATH).expanduser()
+    if not path.exists():
+        console.print("[yellow]No Pro license file to remove.[/yellow]")
+        return
+
+    if not yes:
+        confirm = typer.confirm(f"Remove {path}? (server-side license stays valid until you ask the operator to revoke it)")
+        if not confirm:
+            console.print("Aborted.")
+            raise typer.Exit(1)
+
+    path.unlink()
+    console.print(f"[green]✓[/green] Removed {path}")
+    console.print("Server-side license remains valid. Ask the operator to revoke if needed:")
+    console.print("  python -m reflex.admin.revoke_license --license-id <yours>")
+
+
 # Register `reflex {finetune,distill}` (legacy hidden) AND `reflex train
 # {finetune,distill}` (new). Same callable; old scripts still work.
 # Lazy-import protects users who don't have training deps installed — they

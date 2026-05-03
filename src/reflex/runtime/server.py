@@ -1995,9 +1995,66 @@ def create_app(
                 "uses direct predict_from_base64_async path",
                 type(server).__name__,
             )
+        # Pro tier: start daily heartbeat background task if a Pro license is
+        # loaded. The task runs send_heartbeat() every 24h until cancellation.
+        # Defensive — does nothing on free tier where server.pro_license is None.
+        _heartbeat_task = None
+        _pro_license = getattr(server, "pro_license", None)
+        if _pro_license is not None:
+            try:
+                from reflex.pro.activate import heartbeat_fingerprint
+                from reflex.pro.heartbeat import (
+                    LicenseExpiredAtServer,
+                    LicenseRevokedError,
+                    send_heartbeat,
+                )
+                _hb_fp = heartbeat_fingerprint()
+                _hb_license_id = _pro_license.customer_id  # license dict / dataclass — has customer_id
+                _hb_version = getattr(server, "_reflex_version", None) or "unknown"
+
+                async def _heartbeat_loop():
+                    import asyncio as _asyncio_hb
+                    while True:
+                        try:
+                            send_heartbeat(
+                                license_id=_hb_license_id,
+                                hardware_fingerprint=_hb_fp,
+                                reflex_version=_hb_version,
+                            )
+                            logger.debug("Pro heartbeat sent for %s", _hb_license_id)
+                        except LicenseRevokedError as exc:
+                            logger.error("Pro license revoked: %s. Server will refuse new requests.", exc)
+                            server.health_state = "degraded"  # type: ignore[attr-defined]
+                            break
+                        except LicenseExpiredAtServer as exc:
+                            logger.error("Pro license expired at server: %s.", exc)
+                            server.health_state = "degraded"  # type: ignore[attr-defined]
+                            break
+                        except Exception as exc:  # noqa: BLE001 — soft failure, retry next tick
+                            logger.debug("Heartbeat soft failure (will retry): %s", exc)
+                        # 24h interval. Cached license stays valid until
+                        # HEARTBEAT_FRESHNESS_S elapses since the last successful
+                        # heartbeat (handled in pro/license.py at next startup).
+                        await _asyncio_hb.sleep(24 * 3600)
+
+                import asyncio as _asyncio_lifespan
+                _heartbeat_task = _asyncio_lifespan.create_task(_heartbeat_loop())
+                logger.info(
+                    "Pro daily heartbeat started for license %s", _hb_license_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block startup on heartbeat scaffolding
+                logger.warning("Pro heartbeat scaffolding failed: %s", exc)
+
         try:
             yield
         finally:
+            # Cancel the Pro heartbeat task if running.
+            if _heartbeat_task is not None and not _heartbeat_task.done():
+                _heartbeat_task.cancel()
+                try:
+                    await _heartbeat_task
+                except Exception:  # noqa: BLE001 — cancellation is expected
+                    pass
             set_server_up(0)
             if _runtime is not None:
                 try:
