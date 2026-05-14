@@ -119,7 +119,15 @@ def create_ros2_bridge_node(
                 )
 
         def _state_cb(self, msg: Any) -> None:
-            self._last_state = [float(x) for x in msg.position]
+            if hasattr(msg, "position"):
+                self._last_state = [float(x) for x in msg.position]
+            elif hasattr(msg, "orientation"):
+                self._last_state = [
+                    float(msg.orientation.x),
+                    float(msg.orientation.y),
+                    float(msg.orientation.z),
+                    float(msg.orientation.w),
+                ]
 
         def _task_cb(self, msg: Any) -> None:
             self._last_task = str(msg.data)
