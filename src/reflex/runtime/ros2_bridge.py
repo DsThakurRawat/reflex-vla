@@ -13,7 +13,8 @@ robostack before running:
 Default topic layout (override via CLI flags):
     subs:
       /camera/image_raw      sensor_msgs/msg/Image (rgb8)
-      /joint_states          sensor_msgs/msg/JointState (positions → state vector)
+      /joint_states          sensor_msgs/msg/JointState   (arm positions)
+  /mavros/imu/data       sensor_msgs/msg/Imu          (drone attitude) (positions → state vector)
       /reflex/task           std_msgs/msg/String (text instruction)
     pub:
       /reflex/actions        std_msgs/msg/Float32MultiArray (flat chunk × action_dim)
